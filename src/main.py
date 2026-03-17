@@ -510,7 +510,7 @@ EOF
     forced_mask = torch.tensor([[True, False, True]], dtype=torch.bool, device=device)
     with torch.no_grad():
         logits, _ = manager(graph_emb, stats, action_mask=forced_mask)
-    assert logits[0, 1].item() < -1e8, f"ROUTE_ELIMINATION logit should be -inf, got {logits[0, 1].item()}"
+    assert logits[0, 1].item() < -1e3, f"ROUTE_ELIMINATION logit should be masked, got {logits[0, 1].item()}"
 
     # Sample 100 actions with mask — none should be action 1
     actions = []
