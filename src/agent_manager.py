@@ -84,7 +84,7 @@ class FleetManager(nn.Module):
         features = self.shared(obs)       # (B, 64)
         action_logits = self.actor(features)  # (B, 3)
         if action_mask is not None:
-            action_logits = action_logits.masked_fill(~action_mask, -1e9)
+            action_logits = action_logits.masked_fill(~action_mask, -1e4)
         state_value = self.critic(features)   # (B, 1)
         return action_logits, state_value
 
