@@ -36,7 +36,16 @@ The web app calls this on startup to show the green "SYSTEM READY" dot in the si
   "status": "ready",
   "device": "cuda",
   "gpu_name": "NVIDIA T4",
-  "model_loaded": true
+  "model_loaded": true,
+  "stage_health": {
+    "gnn_observer":   1.00,
+    "fleet_manager":  1.00,
+    "hgs_engine":     1.00,
+    "route_driver":   0.88,
+    "maca_trainer":   0.61
+  },
+  "total_training_epochs": 84,
+  "best_score_ever": 15821.3
 }
 ```
 
@@ -46,6 +55,14 @@ The web app calls this on startup to show the green "SYSTEM READY" dot in the si
 | `device` | string | `"cuda"` or `"cpu"` |
 | `gpu_name` | string | GPU name, or `"CPU only"` |
 | `model_loaded` | bool | Whether GNNEncoder + agents are loaded |
+| `stage_health.gnn_observer` | float 0–1 | GNN encoder training convergence. Use `1.0` once training is complete. |
+| `stage_health.fleet_manager` | float 0–1 | Fleet Manager PPO agent convergence ratio (e.g. current epoch / total epochs). |
+| `stage_health.hgs_engine` | float 0–1 | Always `1.0` — HGS is a classical solver, not trained. |
+| `stage_health.route_driver` | float 0–1 | Route Driver PPO agent convergence ratio. |
+| `stage_health.maca_trainer` | float 0–1 | Reward propagation training progress. |
+| `total_training_epochs` | int | How many PPO training epochs have completed so far. |
+| `best_score_ever` | float | The lowest `1000×NV + TD` score achieved across all training runs. |
+
 
 ---
 
