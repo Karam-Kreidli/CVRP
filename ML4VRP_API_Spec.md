@@ -192,6 +192,166 @@ The web app calls this **every 500ms** while a job is running to update the live
 
 ---
 
+### ⚠️ Critical — How the `status` Field Controls the Entire App Flow
+
+The `status` field in the `/status` response is not just informational — **it directly controls what the Flutter app does next.** The app polls this endpoint every 500ms and takes a specific action depending on the value:
+
+| `status` value | What the Flutter app does |
+|---|---|
+| `"running"` | Keeps polling every 500ms, updates pipeline stages and live metrics on screen |
+| `"complete"` | **Stops polling immediately. Navigates to the Solution Viewer. Calls `GET /result/{job_id}` to load the final routes.** |
+| `"error"` | Stops polling. Shows an error state on the Solver Console. |
+| `"stopped"` | Stops polling. Shows a stopped state (triggered by the user clicking Stop). |
+
+**If you never return `"complete"`, the app polls forever and the Solution Viewer never loads.** This is the most common integration mistake — the backend solve loop finishes but the job status is never updated from `"running"` to `"complete"`.
+
+### How to Implement the Status Transition in Python
+
+The key principle: your background thread must update `jobs[job_id]["status"]` to `"complete"` **after** all 5 stages have finished and the result has been stored. Here is the exact pattern:
+
+```python
+import threading
+from uuid import uuid4
+
+jobs: dict[str, dict] = {}
+
+def run_solver_background(job_id: str, vrp_file_path: str):
+    """
+    This runs in a background thread. The main thread returns 202 immediately.
+    This function updates jobs[job_id] as it progresses through all 5 stages.
+    """
+    try:
+        # ── Stage 1: GNN Observer ─────────────────────────────────────────
+        jobs[job_id]["current_stage"] = 1
+        jobs[job_id]["stage_statuses"]["1"] = "running"
+        jobs[job_id]["log_lines"].append("[GNN] Starting graph embedding...")
+
+        # ... your actual GNN code here ...
+        embedding = gnn_encoder.encode(vrp_file_path)
+
+        jobs[job_id]["stage_statuses"]["1"] = "done"
+        jobs[job_id]["stage_times_seconds"]["1"] = 0.3
+        jobs[job_id]["log_lines"].append("[GNN] Graph embedding complete — 128-dim vector")
+
+        # ── Stage 2: Fleet Manager ────────────────────────────────────────
+        jobs[job_id]["current_stage"] = 2
+        jobs[job_id]["stage_statuses"]["2"] = "running"
+
+        # ... your Fleet Manager PPO code here ...
+
+        jobs[job_id]["stage_statuses"]["2"] = "done"
+        jobs[job_id]["stage_times_seconds"]["2"] = 1.2
+
+        # ── Stage 3: HGS Engine ───────────────────────────────────────────
+        jobs[job_id]["current_stage"] = 3
+        jobs[job_id]["stage_statuses"]["3"] = "running"
+
+        # ... your HGS solve loop here ...
+        # Inside the loop, update metrics so the frontend sees live progress:
+        jobs[job_id]["current_nv"] = info["nv"]
+        jobs[job_id]["best_nv"]    = info["best_nv"]
+        jobs[job_id]["current_td"] = info["td"]
+        jobs[job_id]["best_td"]    = info["best_td"]
+        jobs[job_id]["iteration"]  = info["total_iters"]
+        jobs[job_id]["log_lines"].append(f"[HGS] Iteration {info['total_iters']} / 10000")
+        jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]  # keep last 10
+
+        jobs[job_id]["stage_statuses"]["3"] = "done"
+
+        # ── Stages 4 & 5: Route Driver + MACA ────────────────────────────
+        # ... repeat the same pattern for stages 4 and 5 ...
+
+        jobs[job_id]["stage_statuses"]["4"] = "done"
+        jobs[job_id]["stage_statuses"]["5"] = "done"
+
+        # ── CRITICAL STEP: Store the final result BEFORE marking complete ─
+        # The Flutter app will immediately call GET /result/{job_id}
+        # as soon as it sees "complete". If result is not stored yet,
+        # that call will fail. Always store result first, then set complete.
+        jobs[job_id]["result"] = build_result_payload(job_id, solution, data)
+
+        # ── CRITICAL STEP: Mark the job as complete ───────────────────────
+        # This is the line that tells Flutter to stop polling and navigate
+        # to the Solution Viewer. Without this line, the app polls forever.
+        jobs[job_id]["status"] = "complete"                          # ← DO NOT FORGET THIS
+        jobs[job_id]["log_lines"].append("[✓] Solve complete")
+
+    except Exception as e:
+        # If anything goes wrong, set "error" so the frontend stops polling
+        # and shows an error state instead of spinning forever.
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["log_lines"].append(f"[ERROR] {str(e)}")
+
+
+@app.post("/solve")
+async def solve(file: UploadFile, track: str = "cvrp", mode: str = "competition"):
+    job_id = uuid4().hex[:8]
+
+    # Initialise the job dict — status starts as "running"
+    jobs[job_id] = {
+        "status": "running",          # ← starts as running
+        "current_stage": 1,
+        "stage_statuses": {"1": "waiting", "2": "waiting", "3": "waiting", "4": "waiting", "5": "waiting"},
+        "stage_times_seconds": {"1": None, "2": None, "3": None, "4": None, "5": None},
+        "current_nv": 0, "best_nv": 0,
+        "current_td": 0.0, "best_td": 0.0,
+        "current_score": 0.0, "best_score": 0.0,
+        "iteration": 0, "max_iterations": 10000,
+        "elapsed_seconds": 0,
+        "log_lines": [],
+        "result": None,
+    }
+
+    # Save file to disk so the background thread can read it
+    vrp_path = f"/tmp/{job_id}.vrp"
+    with open(vrp_path, "wb") as f:
+        f.write(await file.read())
+
+    # Launch background thread — returns 202 immediately while solve runs
+    thread = threading.Thread(
+        target=run_solver_background,
+        args=(job_id, vrp_path),
+        daemon=True,
+    )
+    thread.start()
+
+    # Return immediately with the job_id
+    return JSONResponse(status_code=202, content={
+        "job_id": job_id,
+        "instance_name": file.filename.replace(".vrp", ""),
+        # parse num_nodes, vehicle_capacity, total_demand, nv_min from the file
+        ...
+    })
+```
+
+### The Complete Status Lifecycle
+
+```
+POST /solve called
+       │
+       ▼
+jobs[job_id]["status"] = "running"   ← set at job creation
+       │
+       ▼  (background thread works through stages 1→5)
+       │
+       ▼
+jobs[job_id]["result"] = { ... }     ← STORE RESULT FIRST
+       │
+       ▼
+jobs[job_id]["status"] = "complete"  ← THEN mark complete
+       │
+       ▼  (Flutter sees "complete" on next 500ms poll)
+       │
+       ▼
+Flutter stops polling
+Flutter calls GET /result/{job_id}
+Flutter navigates to Solution Viewer ✓
+```
+
+**The order matters:** always store the result object before setting status to `"complete"`. If you set `"complete"` first, the Flutter app will immediately call `GET /result/{job_id}` and find `result: None`.
+
+---
+
 ## Endpoint 4 — Get Final Result
 
 ```
@@ -392,4 +552,4 @@ def on_step(info: dict, stage: int, log_msg: str):
 
 ---
 
-*ML4VRP 2026 — GECCO Competition · API Spec v1.0*
+*ML4VRP 2026 — GECCO Competition · API Spec v2.0*
