@@ -2,15 +2,16 @@
 Stage 3 - HGS Engine Wrapper: Gymnasium environment wrapping PyVRP's ILS solver.
 
 Maps the Fleet Manager's discrete actions to PyVRP solver parameter regimes:
-  0 = INTENSIVE_POLISH  — Run ILS for N iterations with default parameters
-  1 = ROUTE_ELIMINATION — Run ILS with heavily penalized capacity violations
-                          (high fixed_cost forces fleet reduction)
-  2 = DIVERSITY_EXPLORE — Restart ILS from a new random seed with increased
-                          perturbation range for exploration
+  0 = POLISH              — Default ILS, same seed (route optimization)
+  1 = MILD_PRESSURE       — penalty_increase=2.0  (gentle fleet reduction)
+  2 = MODERATE_PRESSURE   — penalty_increase=5.0  (steady fleet reduction)
+  3 = AGGRESSIVE_PRESSURE — penalty_increase=10.0 (force route merges)
+  4 = EXPLORE_NEW_SEED    — Fresh random seed, default params (escape local optima)
+  5 = EXPLORE_PRESSURE    — Fresh seed + moderate penalty (escape + reduce)
 
 Each step() runs the solver for a fixed iteration budget, then returns the
-updated observation (132-dim), reward (negative change in competition score),
-and termination status.
+updated observation (132-dim), reward (change in competition score), and
+termination status.
 
 Competition score: 1000 * NV + TD  (lower is better)
 """
@@ -38,7 +39,6 @@ from pyvrp import (
 from pyvrp.stop import MaxIterations
 
 from src.model_vision import GNNEncoder
-from src.agent_driver import RouteDriver, OPERATOR_NAMES
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -46,11 +46,14 @@ from src.agent_driver import RouteDriver, OPERATOR_NAMES
 EMBED_DIM = 128
 STATS_DIM = 4
 OBS_DIM = EMBED_DIM + STATS_DIM  # 132
-NUM_ACTIONS = 3
+NUM_ACTIONS = 6
 ITERS_PER_STEP = 1_000
 MAX_STEPS = 20  # episode length: 20 steps × 1000 iters = 20K total iterations
 
-ACTION_NAMES = ["INTENSIVE_POLISH", "ROUTE_ELIMINATION", "DIVERSITY_EXPLORE"]
+ACTION_NAMES = [
+    "POLISH", "MILD_PRESSURE", "MODERATE_PRESSURE",
+    "AGGRESSIVE_PRESSURE", "EXPLORE_NEW_SEED", "EXPLORE_PRESSURE",
+]
 
 
 def competition_score(nv: int, td: float) -> float:
@@ -62,7 +65,7 @@ class CVRPEnv(gym.Env):
     """Gymnasium environment wrapping PyVRP for RL-guided CVRP solving.
 
     The agent (Fleet Manager) observes a 132-dim vector and selects one of
-    three search strategies per step. Each step runs PyVRP's ILS for a fixed
+    six search strategies per step. Each step runs PyVRP's ILS for a fixed
     iteration budget under the chosen parameter regime.
 
     Args:
@@ -72,6 +75,7 @@ class CVRPEnv(gym.Env):
         iters_per_step: PyVRP iterations per environment step.
         max_steps: Maximum steps per episode before truncation.
         round_func: Rounding function for reading instances ("round" for X-dataset).
+        max_nodes: Curriculum filter — only use instances with N ≤ max_nodes.
     """
 
     metadata = {"render_modes": []}
@@ -84,7 +88,6 @@ class CVRPEnv(gym.Env):
         iters_per_step: int = ITERS_PER_STEP,
         max_steps: int = MAX_STEPS,
         round_func: str = "round",
-        route_driver: RouteDriver | None = None,
         max_nodes: int | None = None,
     ):
         super().__init__()
@@ -96,7 +99,6 @@ class CVRPEnv(gym.Env):
         self.iters_per_step = iters_per_step
         self.max_steps = max_steps
         self.round_func = round_func
-        self.route_driver = route_driver
 
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
@@ -124,15 +126,19 @@ class CVRPEnv(gym.Env):
         return max(1, math.ceil(total_demand / capacity))
 
     def get_action_mask(self) -> np.ndarray:
-        """Return a boolean mask over 3 actions. True = allowed, False = masked.
+        """Return a boolean mask over 6 actions. True = allowed, False = masked.
 
-        Masks ROUTE_ELIMINATION (action 1) when current NV <= NV_min.
+        Masks all pressure actions (1, 2, 3, 5) when current NV <= NV_min,
+        since we can't reduce the fleet below the theoretical minimum.
         """
         mask = np.ones(NUM_ACTIONS, dtype=bool)
         if self._best_solution is not None:
             current_nv = self._best_solution.num_routes()
             if current_nv <= self._nv_min:
-                mask[1] = False  # block ROUTE_ELIMINATION
+                mask[1] = False  # MILD_PRESSURE
+                mask[2] = False  # MODERATE_PRESSURE
+                mask[3] = False  # AGGRESSIVE_PRESSURE
+                mask[5] = False  # EXPLORE_PRESSURE
         return mask
 
     def _filter_by_nodes(self, paths: list[pathlib.Path]) -> list[pathlib.Path]:
@@ -209,7 +215,7 @@ class CVRPEnv(gym.Env):
         """Execute one search strategy step.
 
         Args:
-            action: 0=INTENSIVE_POLISH, 1=ROUTE_ELIMINATION, 2=DIVERSITY_EXPLORE
+            action: 0-5, one of the six strategy actions.
 
         Returns:
             observation, reward, terminated, truncated, info
@@ -219,15 +225,6 @@ class CVRPEnv(gym.Env):
 
         # Map action to solver parameters and run
         params, step_seed = self._action_to_params(action)
-
-        # When INTENSIVE_POLISH, consult RouteDriver for operator recommendation
-        operator_choice = None
-        if action == 0 and self.route_driver is not None:
-            self.route_driver.eval()
-            with torch.no_grad():
-                operator_choice, _, _ = self.route_driver.select_operator(
-                    self._node_embeddings
-                )
 
         res = pyvrp.solve(
             self._data,
@@ -247,10 +244,11 @@ class CVRPEnv(gym.Env):
         cand_score = competition_score(cand_nv, cand_td)
 
         # Hard fleet limit: reject solutions that explode the fleet
-        # If ROUTE_ELIMINATION was chosen and the solver panicked (NV spike),
+        # If a pressure action was chosen and the solver panicked (NV spike),
         # apply a static failure penalty instead of using the bad solution.
         prev_nv = self._best_solution.num_routes()
-        fleet_exploded = (action == 1 and cand_nv > prev_nv + 2)
+        is_pressure = action in (1, 2, 3, 5)
+        fleet_exploded = (is_pressure and cand_nv > prev_nv + 2)
 
         if fleet_exploded:
             # Solver panicked — don't update solution, return failure penalty
@@ -285,7 +283,6 @@ class CVRPEnv(gym.Env):
             "fleet_exploded": fleet_exploded,
             "step": self._step_count,
             "total_iters": self._total_iters,
-            "operator": OPERATOR_NAMES[operator_choice] if operator_choice is not None else None,
         }
         return obs, reward, terminated, truncated, info
 
@@ -373,14 +370,22 @@ class CVRPEnv(gym.Env):
             (params, seed) tuple for the pyvrp.solve() call.
         """
         if action == 0:
-            # INTENSIVE_POLISH: default parameters, same seed for continuity
-            params = SolveParams()
-            step_seed = self._seed
+            # POLISH: default parameters, same seed for continuity
+            return SolveParams(), self._seed
 
         elif action == 1:
-            # ROUTE_ELIMINATION: increase penalty pressure to force fewer vehicles.
-            # High penalty_increase + low target_feasible drives the solver toward
-            # solutions that eliminate capacity violations by using fewer, fuller routes.
+            # MILD_PRESSURE: gentle penalty to nudge toward fewer vehicles
+            penalty = PenaltyParams(
+                penalty_increase=2.0,
+                penalty_decrease=0.5,
+                target_feasible=0.5,
+                min_penalty=5.0,
+                max_penalty=50_000.0,
+            )
+            return SolveParams(penalty=penalty), self._seed
+
+        elif action == 2:
+            # MODERATE_PRESSURE: steady penalty for reliable fleet reduction
             penalty = PenaltyParams(
                 penalty_increase=5.0,
                 penalty_decrease=0.5,
@@ -388,16 +393,35 @@ class CVRPEnv(gym.Env):
                 min_penalty=10.0,
                 max_penalty=100_000.0,
             )
-            params = SolveParams(penalty=penalty)
-            step_seed = self._seed
+            return SolveParams(penalty=penalty), self._seed
 
-        elif action == 2:
-            # DIVERSITY_EXPLORE: new random seed for a fresh restart
+        elif action == 3:
+            # AGGRESSIVE_PRESSURE: heavy penalty, force route merges
+            penalty = PenaltyParams(
+                penalty_increase=10.0,
+                penalty_decrease=0.3,
+                target_feasible=0.2,
+                min_penalty=20.0,
+                max_penalty=200_000.0,
+            )
+            return SolveParams(penalty=penalty), self._seed
+
+        elif action == 4:
+            # EXPLORE_NEW_SEED: fresh restart with default params
             self._seed = random.randint(0, 2**31)
-            params = SolveParams()
-            step_seed = self._seed
+            return SolveParams(), self._seed
+
+        elif action == 5:
+            # EXPLORE_PRESSURE: fresh seed + moderate penalty
+            self._seed = random.randint(0, 2**31)
+            penalty = PenaltyParams(
+                penalty_increase=5.0,
+                penalty_decrease=0.5,
+                target_feasible=0.3,
+                min_penalty=10.0,
+                max_penalty=100_000.0,
+            )
+            return SolveParams(penalty=penalty), self._seed
 
         else:
-            raise ValueError(f"Invalid action: {action}. Expected 0, 1, or 2.")
-
-        return params, step_seed
+            raise ValueError(f"Invalid action: {action}. Expected 0-5.")

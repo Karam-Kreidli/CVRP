@@ -1,6 +1,6 @@
 """
-ML4VRP 2026 - Hierarchical MARL-HGS Hybrid Solver
-Primary entry point: training loop (Stage 5) and smoke tests (Stages 1-4).
+ML4VRP 2026 - RL-Guided CVRP Solver
+Primary entry point: training loop and smoke tests.
 
 Usage:
     python -m src.main                                    # run all smoke tests
@@ -99,8 +99,8 @@ def smoke_test_batched():
 
 
 def smoke_test_fleet_manager():
-    """Verify FleetManager forward pass with dummy 132-dim input."""
-    from src.agent_manager import FleetManager
+    """Verify FleetManager forward pass with 6 actions."""
+    from src.agent_manager import FleetManager, NUM_FLEET_ACTIONS
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     manager = FleetManager().to(device)
@@ -111,14 +111,14 @@ def smoke_test_fleet_manager():
 
     action_logits, state_value = manager(graph_emb, solver_stats)
 
-    assert action_logits.shape == (B, 3), f"Expected ({B}, 3), got {action_logits.shape}"
+    assert action_logits.shape == (B, NUM_FLEET_ACTIONS), f"Expected ({B}, {NUM_FLEET_ACTIONS}), got {action_logits.shape}"
     assert state_value.shape == (B, 1), f"Expected ({B}, 1), got {state_value.shape}"
 
     # Verify select_action sampling
     action, log_prob, sv = manager.select_action(graph_emb, solver_stats)
     assert action.shape == (B,), f"Expected ({B},), got {action.shape}"
     assert log_prob.shape == (B,), f"Expected ({B},), got {log_prob.shape}"
-    assert all(a in (0, 1, 2) for a in action.tolist())
+    assert all(0 <= a < NUM_FLEET_ACTIONS for a in action.tolist())
 
     print(f"  Action logits: {action_logits.shape}")
     print(f"  State value:   {state_value.shape}")
@@ -129,7 +129,7 @@ def smoke_test_fleet_manager():
 
 def smoke_test_fleet_manager_fp16():
     """Verify FleetManager under AMP on GPU."""
-    from src.agent_manager import FleetManager
+    from src.agent_manager import FleetManager, NUM_FLEET_ACTIONS
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
@@ -144,7 +144,7 @@ def smoke_test_fleet_manager_fp16():
     with torch.amp.autocast("cuda"):
         action_logits, state_value = manager(graph_emb, solver_stats)
 
-    assert action_logits.shape == (B, 3)
+    assert action_logits.shape == (B, NUM_FLEET_ACTIONS)
     assert state_value.shape == (B, 1)
     print(f"  Action logits dtype: {action_logits.dtype}")
     print(f"  State value dtype:   {state_value.dtype}")
@@ -152,15 +152,14 @@ def smoke_test_fleet_manager_fp16():
 
 
 def smoke_test_pipeline():
-    """End-to-end: GNNEncoder → FleetManager on a synthetic instance."""
+    """End-to-end: GNNEncoder -> FleetManager on a synthetic instance."""
     from src.model_vision import GNNEncoder
-    from src.agent_manager import FleetManager
+    from src.agent_manager import FleetManager, ACTION_NAMES
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     encoder = GNNEncoder().to(device)
     manager = FleetManager().to(device)
 
-    # Synthetic 400-node instance
     N = 401
     coords = torch.rand(N, 2)
     demands = torch.rand(N, 1)
@@ -169,16 +168,12 @@ def smoke_test_pipeline():
     pos = coords.to(device)
     batch = torch.zeros(N, dtype=torch.long, device=device)
 
-    # Stage 1: encode
     node_emb, graph_emb = encoder(x, pos, batch)
-
-    # Stage 2: decide fleet action
-    solver_stats = torch.tensor([[0.5, 0.8, 0.02, 0.1]], device=device)  # mid-run stats
+    solver_stats = torch.tensor([[0.5, 0.8, 0.02, 0.1]], device=device)
     action, log_prob, value = manager.select_action(graph_emb, solver_stats)
 
-    action_names = ["KEEP", "REMOVE", "ADD"]
-    print(f"  GNN → graph_emb: {graph_emb.shape}")
-    print(f"  Fleet Manager → action: {action_names[action.item()]}, value: {value.item():.4f}")
+    print(f"  GNN -> graph_emb: {graph_emb.shape}")
+    print(f"  Fleet Manager -> action: {ACTION_NAMES[action.item()]}, value: {value.item():.4f}")
     print("  PASSED")
 
 
@@ -193,7 +188,6 @@ def smoke_test_cvrp_env():
     encoder = GNNEncoder().to(device)
     encoder.eval()
 
-    # Write a minimal CVRP instance in VRPLIB format (1 depot + 10 customers)
     vrp_content = """\
 NAME : smoke-test-n10
 COMMENT : Smoke test instance
@@ -243,108 +237,29 @@ EOF
         max_steps=5,
     )
 
-    # Reset: initial solve
     obs, info = env.reset(seed=42)
     assert obs.shape == (132,), f"Expected (132,), got {obs.shape}"
-    print(f"  Reset → NV={info['nv']}, TD={info['td']:.0f}, score={info['score']:.0f}")
+    print(f"  Reset -> NV={info['nv']}, TD={info['td']:.0f}, score={info['score']:.0f}")
 
-    # Step through all 3 actions
+    # Step through actions 0, 1, 4 (POLISH, MILD_PRESSURE, EXPLORE_NEW_SEED)
     total_reward = 0.0
-    for action in [0, 1, 2]:
+    for action in [0, 1, 4]:
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         assert obs.shape == (132,)
-        print(f"  Step {info['step']}: {ACTION_NAMES[action]:>20s} → "
+        print(f"  Step {info['step']}: {ACTION_NAMES[action]:>22s} -> "
               f"NV={info['nv']}, TD={info['td']:.0f}, "
               f"reward={reward:+.1f}, score={info['score']:.0f}")
 
     print(f"  Total reward over 3 steps: {total_reward:+.1f}")
 
-    # Cleanup
     os.remove(vrp_path)
     os.rmdir(tmpdir)
     print("  PASSED")
 
 
-def smoke_test_route_driver():
-    """Stage 4: Verify RouteDriver processes 400-node embeddings and selects an operator."""
-    import time
-    from src.agent_driver import RouteDriver, OPERATOR_NAMES
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    driver = RouteDriver().to(device)
-    driver.eval()
-
-    # Simulate 400-node instance embeddings (as would come from GNNEncoder)
-    N = 400
-    node_embeddings = torch.randn(N, 128, device=device)
-
-    # Forward pass — verify shapes
-    with torch.no_grad():
-        logits, value = driver(node_embeddings)
-    assert logits.shape == (1, 4), f"Expected (1, 4), got {logits.shape}"
-    assert value.shape == (1, 1), f"Expected (1, 1), got {value.shape}"
-
-    # Timing: 100 forward passes, report average
-    with torch.no_grad():
-        # Warmup
-        for _ in range(10):
-            driver(node_embeddings)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-
-        start = time.perf_counter()
-        for _ in range(100):
-            driver(node_embeddings)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        elapsed_ms = (time.perf_counter() - start) * 1000 / 100
-
-    # Sampling
-    with torch.no_grad():
-        op, log_prob, sv = driver.select_operator(node_embeddings)
-    assert 0 <= op <= 3, f"Invalid operator index: {op}"
-
-    print(f"  Operator logits: {logits.squeeze().tolist()}")
-    print(f"  Selected operator: {OPERATOR_NAMES[op]}")
-    print(f"  State value: {sv.item():.4f}")
-    print(f"  Avg inference: {elapsed_ms:.2f} ms ({N} nodes)")
-    print(f"  Parameters: {sum(p.numel() for p in driver.parameters()):,}")
-    if elapsed_ms > 10.0:
-        print(f"  WARNING: {elapsed_ms:.2f} ms exceeds 10ms target for T4 GPU")
-    print("  PASSED")
-
-
-def smoke_test_route_driver_fp16():
-    """Stage 4: Verify RouteDriver under AMP on GPU."""
-    from src.agent_driver import RouteDriver, OPERATOR_NAMES
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type != "cuda":
-        print("  Skipped (no GPU)")
-        return
-
-    driver = RouteDriver().to(device)
-    driver.eval()
-    node_embeddings = torch.randn(400, 128, device=device)
-
-    with torch.no_grad(), torch.amp.autocast("cuda"):
-        logits, value = driver(node_embeddings)
-
-    assert logits.shape == (1, 4)
-    assert value.shape == (1, 1)
-    print(f"  Logits dtype: {logits.dtype}")
-    print(f"  Value dtype:  {value.dtype}")
-    print("  PASSED")
-
-
 def smoke_test_training():
-    """Stage 5: Run 2 complete PPO iterations on a synthetic 100-node instance.
-
-    Validates that the full training pipeline (rollout collection, MACA reward
-    decomposition, reward normalization, GAE, PPO backward passes) runs
-    without tensor shape or device errors.
-    """
+    """Stage 5: Run 2 complete PPO iterations on a synthetic 100-node instance."""
     import tempfile
     import os
     import random as pyrandom
@@ -356,7 +271,6 @@ def smoke_test_training():
     encoder = GNNEncoder().to(device)
     encoder.eval()
 
-    # Generate a synthetic 100-node CVRP instance (1 depot + 99 customers)
     pyrandom.seed(42)
     lines = [
         "NAME : smoke-train-n100",
@@ -386,7 +300,6 @@ def smoke_test_training():
         device=device,
         iters_per_step=100,
         max_steps=3,
-        route_driver=None,
     )
 
     config = PPOConfig(
@@ -399,15 +312,13 @@ def smoke_test_training():
                           log_dir=tmpdir, gdrive_path=None)
 
     for i in range(2):
-        stats = trainer.train_epoch(num_episodes=1)
+        stats = trainer.train_epoch(num_episodes=1, run_eval=False)
         print(
             f"  PPO Iteration {i + 1}: "
-            f"score={stats['final_score']:.0f}, "
-            f"NV={stats['final_nv']}, "
-            f"mgr_loss={stats['mgr_policy_loss']:.4f}, "
-            f"drv_loss={stats['drv_policy_loss']:.4f}, "
-            f"mgr_norm={stats.get('mgr_norm_mag', 0):.3f}, "
-            f"drv_norm={stats.get('drv_norm_mag', 0):.3f}"
+            f"score={stats['avg_score']:.0f}, "
+            f"NV={stats['avg_nv']:.0f}, "
+            f"loss={stats['policy_loss']:.4f}, "
+            f"norm={stats.get('norm_mag', 0):.3f}"
         )
 
     # Verify checkpoint save/load round-trip
@@ -416,7 +327,6 @@ def smoke_test_training():
     trainer.load_checkpoint(ckpt_path)
     print(f"  Checkpoint save/load: OK")
 
-    # Cleanup
     import glob as globmod
     for f in globmod.glob(os.path.join(tmpdir, "*")):
         os.remove(f)
@@ -425,22 +335,18 @@ def smoke_test_training():
 
 
 def smoke_test_action_masking():
-    """Stage 6: Verify NV_min calculation and action masking.
-
-    Creates a synthetic instance, computes NV_min, and confirms the Manager
-    cannot choose ROUTE_ELIMINATION when NV <= NV_min.
-    """
+    """Verify NV_min calculation and action masking with 6-action space."""
     import tempfile
     import os
     from src.model_vision import GNNEncoder
-    from src.solver_engine import CVRPEnv
+    from src.solver_engine import CVRPEnv, NUM_ACTIONS
     from src.agent_manager import FleetManager
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     encoder = GNNEncoder().to(device)
     encoder.eval()
 
-    # 1 depot + 10 customers, each demand=10, capacity=50 → NV_min = ceil(100/50) = 2
+    # 1 depot + 10 customers, each demand=10, capacity=50 -> NV_min = ceil(100/50) = 2
     vrp_content = """\
 NAME : mask-test-n10
 COMMENT : Action masking test
@@ -496,7 +402,7 @@ EOF
 
     print(f"  NV_min = ceil(100/50) = {nv_min}")
     print(f"  Current NV = {current_nv}")
-    print(f"  Action mask: {mask.tolist()} (POLISH={mask[0]}, ELIM={mask[1]}, EXPLORE={mask[2]})")
+    print(f"  Action mask ({NUM_ACTIONS} actions): {mask.tolist()}")
     assert nv_min == 2, f"Expected NV_min=2, got {nv_min}"
 
     # Test that FleetManager respects the mask
@@ -506,20 +412,27 @@ EOF
     graph_emb = torch.tensor(obs[:128], dtype=torch.float32, device=device).unsqueeze(0)
     stats = torch.tensor(obs[128:], dtype=torch.float32, device=device).unsqueeze(0)
 
-    # Force mask: block ROUTE_ELIMINATION
-    forced_mask = torch.tensor([[True, False, True]], dtype=torch.bool, device=device)
+    # Force mask: block all pressure actions (1,2,3,5)
+    forced_mask = torch.tensor(
+        [[True, False, False, False, True, False]], dtype=torch.bool, device=device
+    )
     with torch.no_grad():
         logits, _ = manager(graph_emb, stats, action_mask=forced_mask)
-    assert logits[0, 1].item() < -1e3, f"ROUTE_ELIMINATION logit should be masked, got {logits[0, 1].item()}"
 
-    # Sample 100 actions with mask — none should be action 1
+    for blocked in [1, 2, 3, 5]:
+        assert logits[0, blocked].item() < -1e3, \
+            f"Action {blocked} logit should be masked, got {logits[0, blocked].item()}"
+
+    # Sample 100 actions with mask — none should be pressure actions
     actions = []
     for _ in range(100):
         with torch.no_grad():
             a, _, _ = manager.select_action(graph_emb, stats, action_mask=forced_mask)
         actions.append(a.item())
-    assert 1 not in actions, f"ROUTE_ELIMINATION was sampled despite being masked!"
-    print(f"  100 masked samples: {set(actions)} (action 1 never sampled) ✓")
+    blocked_set = {1, 2, 3, 5}
+    sampled_blocked = blocked_set & set(actions)
+    assert not sampled_blocked, f"Blocked actions {sampled_blocked} were sampled despite mask!"
+    print(f"  100 masked samples: {set(actions)} (pressure actions never sampled)")
 
     os.remove(vrp_path)
     os.rmdir(tmpdir)
@@ -540,7 +453,7 @@ def save_to_gdrive(src_path: pathlib.Path, gdrive_dir: str):
 
 
 def train(args):
-    """Run the multi-agent PPO training loop."""
+    """Run the PPO training loop for the Fleet Manager."""
     from src.model_vision import GNNEncoder
     from src.solver_engine import CVRPEnv
     from src.train import MARLTrainer, PPOConfig
@@ -564,15 +477,24 @@ def train(args):
         instance_paths=[str(p) for p in instance_paths],
         encoder=encoder,
         device=device,
-        route_driver=None,
         max_nodes=100 if args.curriculum_epochs > 0 else None,
     )
     if args.curriculum_epochs > 0:
-        print(f"Curriculum: N≤100 for first {args.curriculum_epochs} epochs, then N≤400")
+        print(f"Curriculum: N<=100 for first {args.curriculum_epochs} epochs, then all")
+
+    # Select fixed evaluation instances
+    eval_instances = []
+    if args.eval_instances:
+        eval_instances = [str(p) for p in pathlib.Path(args.eval_instances).glob("*.vrp")]
+    elif len(instance_paths) >= 5:
+        sorted_paths = sorted(instance_paths, key=lambda p: p.stem)
+        step = max(1, len(sorted_paths) // 5)
+        eval_instances = [str(sorted_paths[i]) for i in range(0, len(sorted_paths), step)][:5]
+    if eval_instances:
+        print(f"Eval set: {len(eval_instances)} fixed instances")
 
     config = PPOConfig(
         manager_lr=args.manager_lr,
-        driver_lr=args.driver_lr,
         mini_batch_size=args.batch_size,
         use_fp16=args.fp16,
         ent_coeff=args.ent_coeff,
@@ -582,31 +504,33 @@ def train(args):
         env=env, config=config, device=device,
         log_dir=args.log_dir, gdrive_path=args.gdrive_path,
         total_epochs=args.epochs,
+        eval_instances=eval_instances,
     )
 
     checkpoint_dir = pathlib.Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Training for {args.epochs} epochs...")
+    print(f"Training for {args.epochs} epochs, {args.episodes_per_epoch} episodes/epoch...")
     curriculum_expanded = False
     for epoch in range(1, args.epochs + 1):
-        # Curriculum: expand to full dataset after curriculum_epochs
         if not curriculum_expanded and epoch > args.curriculum_epochs and args.curriculum_epochs > 0:
             env.set_max_nodes(None)
             curriculum_expanded = True
-            print(f"  [Epoch {epoch}] Curriculum expanded: now using all instances (N≤400)")
+            print(f"  [Epoch {epoch}] Curriculum expanded: now using all instances")
 
         stats = trainer.train_epoch(num_episodes=args.episodes_per_epoch)
+
+        eval_str = ""
+        if "eval_score" in stats:
+            eval_str = f" | Eval: {stats['eval_score']:>8.0f}"
         print(
             f"[{epoch:>4d}/{args.epochs}] "
-            f"Score: {stats['final_score']:>8.0f} | "
-            f"NV: {stats['final_nv']:>2d} | "
-            f"TD: {stats['final_td']:>8.0f} | "
-            f"MgrPL: {stats['mgr_policy_loss']:>7.4f} | "
-            f"DrvPL: {stats['drv_policy_loss']:>7.4f} | "
-            f"MgrNrm: {stats.get('mgr_norm_mag', 0):.3f} | "
-            f"DrvNrm: {stats.get('drv_norm_mag', 0):.3f} | "
-            f"LR: {stats.get('mgr_lr', 0):.1e}/{stats.get('drv_lr', 0):.1e}"
+            f"AvgScore: {stats['avg_score']:>8.0f} | "
+            f"AvgNV: {stats['avg_nv']:>5.1f} | "
+            f"AvgTD: {stats['avg_td']:>8.0f}{eval_str} | "
+            f"PL: {stats['policy_loss']:>7.4f} | "
+            f"Ent: {stats['entropy']:.3f} | "
+            f"LR: {stats['lr']:.1e}"
         )
 
         if epoch % args.save_interval == 0:
@@ -625,21 +549,22 @@ def train(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="ML4VRP 2026 - Hierarchical MARL-HGS Hybrid Solver"
+        description="ML4VRP 2026 - RL-Guided CVRP Solver"
     )
     sub = parser.add_subparsers(dest="mode")
 
-    # Train subcommand
-    tp = sub.add_parser("train", help="Run multi-agent PPO training")
+    tp = sub.add_parser("train", help="Run PPO training")
     tp.add_argument("--epochs", type=int, default=100)
     tp.add_argument("--batch_size", type=int, default=64)
     tp.add_argument("--instance_path", type=str, required=True,
                      help="Path to .vrp file or directory of .vrp files")
     tp.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     tp.add_argument("--save_interval", type=int, default=10)
-    tp.add_argument("--episodes_per_epoch", type=int, default=1)
+    tp.add_argument("--episodes_per_epoch", type=int, default=8,
+                     help="Episodes per epoch (more = stabler gradients)")
+    tp.add_argument("--eval_instances", type=str, default=None,
+                     help="Directory of .vrp files for fixed evaluation")
     tp.add_argument("--manager_lr", type=float, default=1e-4)
-    tp.add_argument("--driver_lr", type=float, default=5e-4)
     tp.add_argument("--fp16", action="store_true",
                      help="Enable FP16 mixed precision (requires CUDA)")
     tp.add_argument("--ent_coeff", type=float, default=0.05,
@@ -649,7 +574,7 @@ def parse_args():
     tp.add_argument("--gdrive_path", type=str, default=None,
                      help="Google Drive directory for checkpoint backup")
     tp.add_argument("--curriculum_epochs", type=int, default=20,
-                     help="Epochs to restrict to small instances (N<=100) before expanding")
+                     help="Epochs to restrict to small instances before expanding")
 
     return parser.parse_args()
 
@@ -660,25 +585,20 @@ if __name__ == "__main__":
     if args.mode == "train":
         train(args)
     else:
-        # Default: run all smoke tests
         print("=== Stage 1: Single Instance ===")
         smoke_test()
         print("\n=== Stage 1: FP16 (400 nodes) ===")
         smoke_test_fp16()
         print("\n=== Stage 1: Batched (variable sizes) ===")
         smoke_test_batched()
-        print("\n=== Stage 2: Fleet Manager ===")
+        print("\n=== Stage 2: Fleet Manager (6 actions) ===")
         smoke_test_fleet_manager()
         print("\n=== Stage 2: Fleet Manager FP16 ===")
         smoke_test_fleet_manager_fp16()
         print("\n=== Stage 1+2: End-to-End Pipeline ===")
         smoke_test_pipeline()
-        print("\n=== Stage 3: CVRPEnv (PyVRP wrapper) ===")
+        print("\n=== Stage 3: CVRPEnv (PyVRP wrapper, 6 actions) ===")
         smoke_test_cvrp_env()
-        print("\n=== Stage 4: Route Driver (400 nodes) ===")
-        smoke_test_route_driver()
-        print("\n=== Stage 4: Route Driver FP16 ===")
-        smoke_test_route_driver_fp16()
         print("\n=== Stage 5: Training (2 PPO iterations) ===")
         smoke_test_training()
         print("\n=== Stage 6: Action Masking & NV_min ===")

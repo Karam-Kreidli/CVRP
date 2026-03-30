@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"\\\\.py$|\\\\.md$|\\\\.txt$\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/train.py''\\).read\\(\\)\\); print\\(''train.py OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/main.py''\\).read\\(\\)\\); print\\(''main.py OK''\\)\")"
+    ]
+  }
+}
