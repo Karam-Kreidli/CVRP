@@ -60,11 +60,8 @@ if [ "$EXISTING" -ge 50 ]; then
     echo "$EXISTING instances already in $DATA_DIR"
 else
     TEMP_DIR=$(mktemp -d)
-    git clone --depth 1 --filter=blob:none --sparse \
-        https://github.com/ML4VRP/ML4VRP2026.git "$TEMP_DIR/ml4vrp_repo"
-    cd "$TEMP_DIR/ml4vrp_repo"
-    git sparse-checkout set Instances/cvrp/vrp
-    cp Instances/cvrp/vrp/X-n*.vrp "$DATA_DIR/"
+    git clone --depth 1 https://github.com/ML4VRP/ML4VRP2026.git "$TEMP_DIR/ml4vrp_repo"
+    cp "$TEMP_DIR/ml4vrp_repo/Instances/cvrp/vrp/X-n"*.vrp "$DATA_DIR/" 2>/dev/null || true
     cd "$PROJECT_DIR"
     rm -rf "$TEMP_DIR"
     echo "Downloaded $(find "$DATA_DIR" -name "X-n*.vrp" | wc -l) instances"

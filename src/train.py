@@ -1,12 +1,31 @@
 """
 Stage 5 - Training Loop: PPO-based optimization of the Fleet Manager.
 
-Trains the Fleet Manager to select optimal solver strategies using PPO:
-  - Reward: change in competition score (1000*NV + TD), normalized online
-  - Running Mean/Std reward normalization (Welford's online algorithm)
-  - FP16 mixed precision via autocast + GradScaler for Colab T4
-  - GAE-λ for advantage estimation with optional early KL stopping
-  - Fixed evaluation set for tracking real learning progress
+This is the learning engine. It trains the Fleet Manager to pick better
+solver strategies over time using Proximal Policy Optimization (PPO).
+
+HOW PPO TRAINING WORKS (simplified):
+  1. COLLECT EXPERIENCE: Run 8 episodes, each with 20 steps. The agent picks
+     actions, the solver runs, and we record (state, action, reward) transitions.
+  2. COMPUTE ADVANTAGES: For each transition, calculate "how much better was
+     this action compared to the average?" using GAE-λ (Generalized Advantage
+     Estimation). This tells us which actions were surprisingly good or bad.
+  3. UPDATE THE POLICY: Run 4 mini-epochs of gradient descent on the collected
+     data. PPO's "clipped objective" prevents the policy from changing too much
+     in one update (stability).
+  4. EVALUATE: Run the current policy greedily (no randomness) on 5 fixed
+     instances to track real learning progress.
+
+KEY FEATURES:
+  - Reward normalization (Welford's algorithm): Removing a vehicle gives reward ≈ +1000,
+    while polishing routes gives reward ≈ +10. Without normalization, vehicle removals
+    would dominate the gradient signal and destabilize training.
+  - FP16 mixed precision: Halves memory usage on GPU, enabling larger batches.
+  - Action masking: Prevents impossible actions from being selected.
+  - Linear LR decay: Learning rate decreases from 1e-4 to 5e-5 over training,
+    allowing large updates early and fine-tuning later.
+  - Fixed evaluation set: AvgScore is noisy (random instances each episode).
+    Eval score on 5 fixed instances is the real progress metric.
 """
 
 from __future__ import annotations
@@ -34,18 +53,62 @@ from src.solver_engine import CVRPEnv
 
 @dataclass
 class PPOConfig:
-    """PPO hyperparameters."""
-    gamma: float = 0.99
-    lam: float = 0.95
-    epsilon_clip: float = 0.2
-    vf_coeff: float = 0.5
-    ent_coeff: float = 0.05
-    manager_lr: float = 1e-4
-    ppo_epochs: int = 4
-    mini_batch_size: int = 64
-    max_grad_norm: float = 0.5
-    use_fp16: bool = True
-    target_kl: Optional[float] = 0.015
+    """PPO hyperparameters — these control the learning dynamics.
+
+    Tuning these values affects training stability and speed. The defaults
+    are standard PPO values that work well for this problem.
+    """
+
+    # --- Reward discounting ---
+    gamma: float = 0.99        # Discount factor for future rewards (0.99 = future matters a lot).
+                                # At each step, future rewards are multiplied by gamma^t.
+                                # gamma=0.99 over 20 steps means the last step's reward is
+                                # worth 0.99^19 ≈ 0.83 of its face value.
+
+    lam: float = 0.95          # GAE-λ: bias-variance tradeoff for advantage estimation.
+                                # λ=1.0 → high variance, unbiased (Monte Carlo-like)
+                                # λ=0.0 → low variance, biased (TD-like)
+                                # λ=0.95 is a good middle ground for most RL problems.
+
+    # --- PPO clipping ---
+    epsilon_clip: float = 0.2  # PPO clip range: policy ratio is clamped to [1-ε, 1+ε].
+                                # This prevents the policy from changing too drastically
+                                # in a single update. Without clipping, a few lucky rewards
+                                # could cause the policy to overfit to specific strategies.
+
+    # --- Loss coefficients ---
+    vf_coeff: float = 0.5     # Weight of the value (critic) loss in the total loss.
+                                # Total loss = policy_loss + 0.5*value_loss - 0.05*entropy
+
+    ent_coeff: float = 0.05   # Entropy bonus: encourages exploration by penalizing
+                                # overly confident policies. Higher values = more randomness.
+                                # If entropy drops to 0, the agent has "collapsed" to always
+                                # picking the same action (bad — it stopped exploring).
+
+    # --- Optimizer ---
+    manager_lr: float = 1e-4  # Learning rate for Adam optimizer. Decays linearly to 50%
+                                # over training (see LinearLR scheduler in MARLTrainer).
+
+    # --- Mini-batch training ---
+    ppo_epochs: int = 4        # Number of passes over the collected data per PPO update.
+                                # More epochs = more learning per rollout, but risk overfitting
+                                # to the current batch (hence the KL early stopping below).
+
+    mini_batch_size: int = 64  # Transitions per gradient step. With 8 episodes × 20 steps
+                                # = 160 transitions per rollout, this gives ~2-3 mini-batches.
+
+    max_grad_norm: float = 0.5 # Gradient clipping: prevents exploding gradients by scaling
+                                # down the gradient if its norm exceeds this threshold.
+
+    # --- Mixed precision ---
+    use_fp16: bool = True      # FP16 (half precision) training via PyTorch AMP.
+                                # Cuts GPU memory usage roughly in half with minimal accuracy loss.
+
+    # --- Safety ---
+    target_kl: Optional[float] = 0.015  # KL divergence threshold for early stopping.
+                                         # If the policy changes too much in one PPO update
+                                         # (KL > 1.5 × target_kl), we stop early to prevent
+                                         # catastrophic policy updates.
 
 
 # ---------------------------------------------------------------------------
@@ -53,34 +116,55 @@ class PPOConfig:
 # ---------------------------------------------------------------------------
 
 class RunningMeanStd:
-    """Welford's online algorithm for tracking mean and variance.
+    """Welford's online algorithm for tracking running mean and variance.
 
-    Prevents the Manager's ±1000 vehicle rewards from causing gradient
-    explosions by normalizing to unit variance.
+    WHY DO WE NEED THIS?
+      Rewards in our system have a huge range:
+        - Removing a vehicle: reward ≈ +1000  (huge!)
+        - Polishing routes:   reward ≈ +5 to +50  (small)
+        - Fleet explosion:    reward = -5.0  (penalty)
+
+      If we feed these raw rewards into PPO, the +1000 vehicle rewards would
+      dominate the gradients and cause training instability. By normalizing
+      rewards to roughly unit variance (mean≈0, std≈1), all reward signals
+      contribute proportionally to learning.
+
+    HOW IT WORKS:
+      Uses Welford's algorithm to maintain a running mean and variance
+      that updates incrementally with each batch of rewards. Unlike computing
+      mean/std over the whole history, this is numerically stable and O(1) memory.
+
+      The statistics are saved in checkpoints so they persist across training resumes.
     """
 
     def __init__(self, epsilon: float = 1e-8):
         self.mean = 0.0
         self.var = 1.0
-        self.count = epsilon
+        self.count = epsilon  # Small epsilon to avoid division by zero initially
 
     def update(self, x: np.ndarray):
-        """Update running statistics with a batch of values."""
+        """Update running mean/variance with a new batch of reward values.
+
+        Uses the parallel/batch version of Welford's algorithm to merge
+        the new batch statistics with the running statistics.
+        """
         batch_mean = np.mean(x)
         batch_var = np.var(x)
         batch_count = len(x)
+
+        # Merge running stats with batch stats (parallel Welford's)
         delta = batch_mean - self.mean
         total = self.count + batch_count
         new_mean = self.mean + delta * batch_count / total
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
+        m_a = self.var * self.count       # Running sum of squared deviations
+        m_b = batch_var * batch_count     # Batch sum of squared deviations
         m2 = m_a + m_b + delta ** 2 * self.count * batch_count / total
         self.mean = new_mean
         self.var = m2 / total
         self.count = total
 
     def normalize(self, x: np.ndarray) -> np.ndarray:
-        """Normalize values using running statistics."""
+        """Normalize values to approximately zero mean, unit variance."""
         return (x - self.mean) / (math.sqrt(self.var) + 1e-8)
 
 
@@ -89,21 +173,34 @@ class RunningMeanStd:
 # ---------------------------------------------------------------------------
 
 class RolloutBuffer:
-    """Stores transitions for the Fleet Manager (fixed 132-dim observations)."""
+    """Stores transitions collected during experience rollouts.
+
+    During each epoch, the agent interacts with the environment for multiple
+    episodes, generating transitions of the form:
+      (observation, action, log_prob, value, reward, done, action_mask)
+
+    These are stored here and then used for the PPO update. After each PPO
+    update, the buffer is cleared for the next epoch's rollouts.
+
+    The buffer also computes GAE-λ advantages, which tell PPO "how much better
+    (or worse) was each action compared to what the critic expected?"
+    """
 
     def __init__(self):
         self.clear()
 
     def store(self, obs, action, log_prob, value, reward, done, action_mask=None):
-        self.observations.append(obs)
-        self.actions.append(action)
-        self.log_probs.append(log_prob)
-        self.values.append(value)
-        self.rewards.append(reward)
-        self.dones.append(done)
-        self.action_masks.append(action_mask)
+        """Record one transition (one step of one episode)."""
+        self.observations.append(obs)     # (132,) observation vector
+        self.actions.append(action)       # int: which action was taken (0-5)
+        self.log_probs.append(log_prob)   # float: log π(a|s) at the time of action selection
+        self.values.append(value)         # float: V(s) from the critic
+        self.rewards.append(reward)       # float: reward received (after normalization)
+        self.dones.append(done)           # bool: was this the last step of the episode?
+        self.action_masks.append(action_mask)  # (6,) bool: which actions were allowed
 
     def clear(self):
+        """Reset the buffer for a new epoch."""
         self.observations = []
         self.actions = []
         self.log_probs = []
@@ -111,23 +208,54 @@ class RolloutBuffer:
         self.rewards = []
         self.dones = []
         self.action_masks = []
-        self.advantages = []
-        self.returns = []
+        self.advantages = []  # Computed by compute_gae()
+        self.returns = []     # Computed by compute_gae()
 
     def __len__(self):
         return len(self.rewards)
 
     def compute_gae(self, last_value: float, gamma: float, lam: float):
-        """Compute GAE-λ advantages and discounted returns."""
+        """Compute GAE-λ (Generalized Advantage Estimation) advantages.
+
+        WHAT IS AN ADVANTAGE?
+          A(s, a) = "How much better was action 'a' in state 's' compared to
+                     the average action in that state?"
+          Positive advantage → action was better than expected
+          Negative advantage → action was worse than expected
+
+        WHY GAE-λ?
+          There are two extremes for computing advantages:
+            - Monte Carlo (λ=1): Use actual cumulative returns. High variance
+              (noisy because each episode is different) but unbiased.
+            - TD(0) (λ=0): Use one-step bootstrapped returns. Low variance
+              but biased (depends on critic accuracy).
+          GAE-λ interpolates between these using λ=0.95, getting most of the
+          variance reduction of TD while staying close to unbiased.
+
+        The formula (working backwards from the last step):
+          δ_t = r_t + γ * V(s_{t+1}) - V(s_t)     [TD error at step t]
+          A_t = δ_t + γ * λ * A_{t+1}               [GAE accumulation]
+
+        Returns (stored in self.returns) = advantages + values, which is what
+        the critic is trained to predict.
+        """
         T = len(self.rewards)
         advantages = np.zeros(T, dtype=np.float32)
         gae = 0.0
+
+        # Walk backwards through the episode (must accumulate from the end)
         for t in reversed(range(T)):
             next_val = last_value if t == T - 1 else self.values[t + 1]
-            non_terminal = 1.0 - float(self.dones[t])
+            non_terminal = 1.0 - float(self.dones[t])  # 0 at episode boundaries
+
+            # TD error: actual reward + discounted next value - predicted value
             delta = self.rewards[t] + gamma * next_val * non_terminal - self.values[t]
+
+            # Accumulate GAE (exponentially weighted sum of TD errors)
             gae = delta + gamma * lam * non_terminal * gae
             advantages[t] = gae
+
+        # Returns = advantages + values (target for critic training)
         values_arr = np.array(self.values, dtype=np.float32)
         self.advantages = advantages.tolist()
         self.returns = (advantages + values_arr).tolist()
@@ -140,17 +268,24 @@ class RolloutBuffer:
 class MARLTrainer:
     """PPO trainer for the Fleet Manager.
 
-    Collects rollouts from CVRPEnv, normalizes rewards, and runs PPO updates.
-    Evaluates on a fixed instance set for tracking real learning progress.
+    This class orchestrates the full training loop:
+      1. collect_rollouts() — run episodes, store transitions
+      2. ppo_update() — compute advantages, run clipped gradient updates
+      3. evaluate() — test current policy on fixed instances (no exploration)
+      4. Logging, checkpointing, and best-model tracking
+
+    The trainer manages all training state (model, optimizer, scheduler,
+    reward normalization statistics) and can save/load checkpoints for
+    resuming interrupted training runs.
 
     Args:
-        env: CVRPEnv instance.
-        config: PPO hyperparameters.
-        device: Torch device.
-        log_dir: Directory for CSV logs and best model.
-        gdrive_path: Optional Google Drive backup directory.
-        total_epochs: Total training epochs (for LR scheduling).
-        eval_instances: List of .vrp file paths for fixed evaluation.
+        env: CVRPEnv instance (the Gymnasium environment).
+        config: PPO hyperparameters (see PPOConfig).
+        device: Torch device (cuda or cpu).
+        log_dir: Directory for CSV logs and best model checkpoint.
+        gdrive_path: Optional Google Drive directory for checkpoint backup.
+        total_epochs: Total training epochs (used for LR scheduling).
+        eval_instances: List of .vrp file paths for fixed evaluation set.
     """
 
     def __init__(
@@ -169,10 +304,16 @@ class MARLTrainer:
         self.log_dir = pathlib.Path(log_dir)
         self.gdrive_path = gdrive_path
 
-        # Model
+        # --- Model ---
+        # The Fleet Manager is the only trainable component.
+        # The GNN Encoder is frozen (not trained by PPO — it's part of the environment).
         self.manager = FleetManager().to(device)
 
-        # Optimizer with linear LR decay to 50%
+        # --- Optimizer ---
+        # Adam: adaptive learning rate optimizer (standard for deep RL).
+        # Linear LR decay: starts at manager_lr (1e-4), linearly decreases to 50%
+        # (5e-5) over total_epochs. This allows large, bold updates early in training
+        # and finer adjustments later as the policy matures.
         self.optimizer = torch.optim.Adam(
             self.manager.parameters(), lr=config.manager_lr
         )
@@ -182,24 +323,34 @@ class MARLTrainer:
             total_iters=total_epochs,
         )
 
-        # FP16 mixed precision
+        # --- FP16 Mixed Precision ---
+        # Uses PyTorch's Automatic Mixed Precision (AMP) to run forward/backward
+        # passes in FP16 (half precision) on GPU. This roughly halves memory usage
+        # and can speed up computation on modern GPUs. GradScaler prevents underflow
+        # in FP16 gradients by dynamically scaling the loss.
         self.amp_enabled = config.use_fp16 and device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
 
-        # Rollout buffer
+        # --- Experience Buffer ---
+        # Stores all transitions from the current epoch's rollouts.
+        # Cleared at the start of each epoch.
         self.buffer = RolloutBuffer()
 
-        # Running reward normalization
+        # --- Reward Normalization ---
+        # Tracks running mean/std of rewards using Welford's algorithm.
+        # All rewards are normalized before computing advantages.
         self.reward_rms = RunningMeanStd()
 
-        # Logging
-        self.epoch_stats: list[dict] = []
-        self.best_score = float("inf")
+        # --- Logging & Tracking ---
+        self.epoch_stats: list[dict] = []     # Full history of epoch metrics
+        self.best_score = float("inf")        # Best eval score seen (lower is better)
 
-        # Fixed evaluation instances for tracking real progress
+        # Fixed evaluation instances: 5 instances used for consistent progress tracking.
+        # AvgScore varies wildly because training uses random instances each episode.
+        # Eval score on fixed instances is the TRUE measure of learning.
         self.eval_instances = eval_instances or []
 
-        # Initialize CSV log
+        # CSV log for plotting training curves
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = self.log_dir / "training_metrics.csv"
         self._csv_header_written = False
@@ -209,45 +360,71 @@ class MARLTrainer:
     # ------------------------------------------------------------------
 
     def evaluate(self) -> dict:
-        """Run greedy evaluation on fixed instances (no exploration, no training).
+        """Run greedy evaluation on fixed instances — the REAL progress metric.
 
-        Returns dict with eval_score, eval_nv, eval_td.
+        WHY A SEPARATE EVALUATION?
+          During training, the agent runs on random instances with stochastic
+          action selection (exploration). The resulting AvgScore is very noisy —
+          it depends on which random instances were selected and which random
+          actions were sampled. You can't tell if the agent is actually learning.
+
+          Evaluation uses:
+            - The SAME 5 instances every time (consistency)
+            - GREEDY action selection (argmax, no randomness)
+          So the eval score purely reflects how well the POLICY has improved.
+
+        Returns:
+            dict with eval_score, eval_nv, eval_td (averaged over 5 instances)
         """
         if not self.eval_instances:
             return {}
 
-        self.manager.eval()
+        self.manager.eval()  # Switch to eval mode (disables dropout, etc.)
 
         scores, nvs, tds = [], [], []
-        orig_paths = self.env.instance_paths
+        orig_paths = self.env.instance_paths  # Save original paths to restore later
+
         for inst_path in self.eval_instances:
+            # Temporarily point the env at just this one instance
             self.env.instance_paths = [pathlib.Path(inst_path)]
             obs, info = self.env.reset()
             done = False
+
             while not done:
+                # Parse observation into graph embedding + solver stats
                 obs_t = torch.tensor(
                     obs, dtype=torch.float32, device=self.device
                 ).unsqueeze(0)
                 graph_emb = obs_t[:, :128]
                 solver_stats = obs_t[:, 128:]
+
+                # Build action mask tensor
                 action_mask = info.get("action_mask")
                 mask_t = None
                 if action_mask is not None:
                     mask_t = torch.tensor(
                         action_mask, dtype=torch.bool, device=self.device
                     ).unsqueeze(0)
+
+                # GREEDY action selection: pick the highest-scoring action
+                # (no sampling, no exploration — pure exploitation)
                 with torch.no_grad():
                     logits, _ = self.manager(
                         graph_emb, solver_stats, action_mask=mask_t
                     )
-                    action_int = logits.argmax(dim=-1).item()  # greedy
+                    action_int = logits.argmax(dim=-1).item()  # Greedy!
+
                 obs, _, terminated, truncated, info = self.env.step(action_int)
                 done = terminated or truncated
+
+            # Record final score for this instance
             scores.append(info["score"])
             nvs.append(info["nv"])
             tds.append(info["td"])
 
+        # Restore original instance paths
         self.env.instance_paths = orig_paths
+
         return {
             "eval_score": float(np.mean(scores)),
             "eval_nv": float(np.mean(nvs)),
@@ -259,16 +436,31 @@ class MARLTrainer:
     # ------------------------------------------------------------------
 
     def collect_rollouts(self, num_episodes: int = 1) -> dict:
-        """Run episodes and collect transitions.
+        """Run episodes to collect experience for PPO training.
 
-        Reward = prev_score - new_score (positive when score improves).
-        Normalized online via Welford's algorithm.
+        This is Phase 1 of the training loop. The agent interacts with the
+        environment using its CURRENT policy, and we record every transition.
+
+        For each of the 8 episodes:
+          1. Reset the environment (random instance, initial solve)
+          2. For 20 steps:
+             - Agent observes state → picks action (STOCHASTIC — with exploration)
+             - Environment executes action → returns reward and next state
+             - Store the transition in the buffer
+          3. Record final score
+
+        After all episodes, we:
+          - Normalize all rewards using running statistics (Welford's)
+          - Compute GAE-λ advantages (how good was each action?)
+
+        The buffer now contains ~160 transitions (8 episodes × 20 steps)
+        ready for the PPO update.
 
         Returns:
-            Dictionary with episode statistics (averaged over episodes).
+            Dictionary with episode statistics (avg score, NV, TD, etc.)
         """
-        self.buffer.clear()
-        self.manager.eval()
+        self.buffer.clear()     # Start fresh each epoch
+        self.manager.eval()     # No dropout during data collection
 
         total_reward = 0.0
         total_steps = 0
@@ -277,38 +469,43 @@ class MARLTrainer:
         episode_tds = []
 
         for _ in range(num_episodes):
-            obs, info = self.env.reset()
+            obs, info = self.env.reset()      # Random instance, initial solve
             action_mask = info.get("action_mask")
             done = False
 
             while not done:
+                # Parse the 132-dim observation into its two components
                 obs_t = torch.tensor(
                     obs, dtype=torch.float32, device=self.device
-                ).unsqueeze(0)
-                graph_emb = obs_t[:, :128]
-                solver_stats = obs_t[:, 128:]
+                ).unsqueeze(0)                          # (1, 132)
+                graph_emb = obs_t[:, :128]              # Instance embedding
+                solver_stats = obs_t[:, 128:]           # 4 solver stats
 
+                # Build action mask tensor for the Fleet Manager
                 mask_t = None
                 if action_mask is not None:
                     mask_t = torch.tensor(
                         action_mask, dtype=torch.bool, device=self.device
                     ).unsqueeze(0)
 
+                # Agent selects an action (stochastic sampling for exploration)
                 with torch.no_grad():
                     action, log_prob, value = self.manager.select_action(
                         graph_emb, solver_stats, action_mask=mask_t
                     )
                 action_int = action.item()
 
+                # Environment executes the action (runs PyVRP for 1000 iterations)
                 next_obs, reward, terminated, truncated, info = self.env.step(action_int)
                 done = terminated or truncated
 
+                # Store this transition in the buffer for later PPO update
                 self.buffer.store(
                     obs=obs.copy(),
                     action=action_int,
-                    log_prob=log_prob.item(),
-                    value=value.squeeze().item(),
-                    reward=reward,
+                    log_prob=log_prob.item(),   # Needed for PPO's importance ratio
+                    value=value.squeeze().item(), # Critic's estimate V(s)
+                    reward=reward,               # Raw reward (normalized below)
                     done=done,
                     action_mask=action_mask.copy() if action_mask is not None else None,
                 )
@@ -318,20 +515,25 @@ class MARLTrainer:
                 obs = next_obs
                 action_mask = info.get("action_mask")
 
+            # Record end-of-episode metrics
             episode_scores.append(info.get("score", 0.0))
             episode_nvs.append(info.get("nv", 0))
             episode_tds.append(info.get("td", 0.0))
 
-        # Normalize rewards with running statistics
+        # --- Reward Normalization ---
+        # Update running mean/std with this epoch's raw rewards, then normalize
+        # all rewards in the buffer to roughly unit variance.
         norm_mag = 0.0
         if len(self.buffer) > 0:
             raw = np.array(self.buffer.rewards)
-            self.reward_rms.update(raw)
-            normed = self.reward_rms.normalize(raw)
-            self.buffer.rewards = normed.tolist()
-            norm_mag = float(np.mean(np.abs(normed)))
+            self.reward_rms.update(raw)               # Update running statistics
+            normed = self.reward_rms.normalize(raw)    # Normalize to ~N(0,1)
+            self.buffer.rewards = normed.tolist()      # Replace raw with normalized
+            norm_mag = float(np.mean(np.abs(normed)))  # Track normalization magnitude
 
-        # Compute GAE-λ advantages
+        # --- Compute Advantages ---
+        # GAE-λ tells PPO which actions were better/worse than expected.
+        # last_value=0.0 because episodes always end at step 20 (no bootstrap needed).
         if len(self.buffer) > 0:
             self.buffer.compute_gae(0.0, self.config.gamma, self.config.lam)
 
@@ -351,13 +553,30 @@ class MARLTrainer:
     # ------------------------------------------------------------------
 
     def ppo_update(self) -> dict:
-        """Run PPO clipped objective update epochs on the Fleet Manager."""
+        """Run PPO clipped objective update — Phase 2 of the training loop.
+
+        This is where the actual LEARNING happens. We take the transitions
+        collected in collect_rollouts() and use them to improve the policy.
+
+        PPO (Proximal Policy Optimization) key idea:
+          We want to update the policy to make good actions more likely and
+          bad actions less likely. But we can't change the policy TOO MUCH
+          in one update, or training becomes unstable. PPO solves this with
+          a "clipped surrogate objective" that limits the policy change.
+
+        The update runs for 4 mini-epochs over the data. If the policy changes
+        too much (KL divergence exceeds threshold), we stop early.
+
+        Returns:
+            dict with average policy_loss, value_loss, entropy over the update.
+        """
         if len(self.buffer) == 0:
             return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
 
-        self.manager.train()
+        self.manager.train()  # Enable dropout, etc.
         cfg = self.config
 
+        # Convert buffer data to tensors for GPU computation
         obs = torch.tensor(
             np.array(self.buffer.observations),
             dtype=torch.float32, device=self.device,
@@ -365,17 +584,17 @@ class MARLTrainer:
         actions = torch.tensor(
             self.buffer.actions, dtype=torch.long, device=self.device
         )
-        old_lp = torch.tensor(
+        old_lp = torch.tensor(           # Log-probs from when the data was collected
             self.buffer.log_probs, dtype=torch.float32, device=self.device
         )
-        advantages = torch.tensor(
+        advantages = torch.tensor(        # GAE-λ advantages (how good was each action?)
             self.buffer.advantages, dtype=torch.float32, device=self.device
         )
-        returns = torch.tensor(
+        returns = torch.tensor(           # Target values for the critic
             self.buffer.returns, dtype=torch.float32, device=self.device
         )
 
-        # Build action masks tensor (True = allowed)
+        # Build action masks tensor (True = action was allowed)
         masks_list = self.buffer.action_masks
         if masks_list and masks_list[0] is not None:
             action_masks = torch.tensor(
@@ -384,18 +603,24 @@ class MARLTrainer:
         else:
             action_masks = None
 
-        # Normalize advantages
+        # Normalize advantages to zero mean, unit variance within this batch.
+        # This is standard PPO practice — it makes the gradient scale consistent
+        # regardless of the absolute magnitude of advantages.
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        T = len(obs)
-        mb_size = min(cfg.mini_batch_size, T)
+        T = len(obs)                          # Total transitions (~160)
+        mb_size = min(cfg.mini_batch_size, T)  # Mini-batch size for each gradient step
         total_pl, total_vl, total_ent, n = 0.0, 0.0, 0.0, 0
 
+        # --- PPO Mini-Epoch Loop ---
+        # Run 4 passes over the data, each time shuffling and splitting into mini-batches.
         for _ in range(cfg.ppo_epochs):
-            indices = torch.randperm(T, device=self.device)
+            indices = torch.randperm(T, device=self.device)  # Shuffle transition order
             for start in range(0, T, mb_size):
                 idx = indices[start : start + mb_size]
+
+                # Extract mini-batch
                 mb_obs = obs[idx]
                 mb_act = actions[idx]
                 mb_old_lp = old_lp[idx]
@@ -403,43 +628,66 @@ class MARLTrainer:
                 mb_ret = returns[idx]
                 mb_mask = action_masks[idx] if action_masks is not None else None
 
+                # Forward pass with optional FP16 for GPU efficiency
                 with torch.amp.autocast("cuda", enabled=self.amp_enabled):
+                    # Get current policy's logits and value estimates
                     logits, values = self.manager(
-                        mb_obs[:, :128], mb_obs[:, 128:],
+                        mb_obs[:, :128], mb_obs[:, 128:],  # graph_emb, solver_stats
                         action_mask=mb_mask,
                     )
                     dist = Categorical(logits=logits)
-                    new_lp = dist.log_prob(mb_act)
-                    entropy = dist.entropy().mean()
+                    new_lp = dist.log_prob(mb_act)   # Log-prob under CURRENT policy
+                    entropy = dist.entropy().mean()   # Policy randomness
 
+                    # --- PPO Clipped Surrogate Objective ---
+                    # ratio = π_new(a|s) / π_old(a|s)
+                    # If ratio > 1: current policy is MORE likely to take this action
+                    # If ratio < 1: current policy is LESS likely
                     ratio = torch.exp(new_lp - mb_old_lp)
+
+                    # Two surrogate objectives:
+                    # surr1: raw ratio × advantage (unconstrained update)
+                    # surr2: clipped ratio × advantage (constrained to [1-ε, 1+ε])
                     surr1 = ratio * mb_adv
                     surr2 = torch.clamp(
                         ratio, 1.0 - cfg.epsilon_clip, 1.0 + cfg.epsilon_clip
                     ) * mb_adv
+
+                    # Take the MINIMUM of the two → pessimistic bound.
+                    # This prevents the policy from changing too much in one step.
                     policy_loss = -torch.min(surr1, surr2).mean()
+
+                    # Critic loss: MSE between predicted V(s) and actual returns
                     value_loss = F.mse_loss(values.squeeze(-1), mb_ret)
+
+                    # Total loss = policy + value - entropy_bonus
+                    # The entropy bonus (subtracted because we minimize loss)
+                    # encourages exploration by penalizing overly deterministic policies.
                     loss = (
                         policy_loss
-                        + cfg.vf_coeff * value_loss
-                        - cfg.ent_coeff * entropy
+                        + cfg.vf_coeff * value_loss    # 0.5 × value loss
+                        - cfg.ent_coeff * entropy       # 0.05 × entropy bonus
                     )
 
+                # --- Gradient Step ---
                 self.optimizer.zero_grad()
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(
+                self.scaler.scale(loss).backward()       # Compute gradients (FP16-safe)
+                self.scaler.unscale_(self.optimizer)      # Unscale for gradient clipping
+                nn.utils.clip_grad_norm_(                 # Clip gradient norm to 0.5
                     self.manager.parameters(), cfg.max_grad_norm
                 )
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.scaler.step(self.optimizer)          # Apply the update
+                self.scaler.update()                      # Adjust FP16 loss scale
 
                 total_pl += policy_loss.item()
                 total_vl += value_loss.item()
                 total_ent += entropy.item()
                 n += 1
 
-            # Early stopping on KL divergence
+            # --- KL Divergence Early Stopping ---
+            # After each mini-epoch, check if the policy has drifted too far
+            # from the old policy. If KL > 1.5 × target_kl, stop updating
+            # to prevent catastrophic policy changes.
             if cfg.target_kl is not None:
                 with torch.no_grad():
                     logits_all, _ = self.manager(
@@ -451,7 +699,7 @@ class MARLTrainer:
                         - Categorical(logits=logits_all).log_prob(actions)
                     ).mean().item()
                     if kl > 1.5 * cfg.target_kl:
-                        break
+                        break  # Policy changed too much — stop here
 
         n = max(n, 1)
         return {
@@ -465,14 +713,32 @@ class MARLTrainer:
     # ------------------------------------------------------------------
 
     def train_epoch(self, num_episodes: int = 1, run_eval: bool = True) -> dict:
-        """One full training iteration: collect rollouts + PPO update + eval."""
+        """One full training epoch: collect → update → evaluate.
+
+        This is the top-level training step called once per epoch:
+          1. Collect rollouts (8 episodes of 20 steps each)
+          2. PPO update (learn from collected experience)
+          3. Step the LR scheduler (linear decay)
+          4. Evaluate on fixed instances (track real progress)
+          5. Save best model if eval score improved
+          6. Log metrics to CSV
+
+        Returns:
+            dict with all metrics for this epoch (for printing/logging).
+        """
+        # Phase 1: Collect experience using current policy
         rollout_stats = self.collect_rollouts(num_episodes)
+
+        # Phase 2: Learn from the collected experience
         ppo_stats = self.ppo_update()
 
+        # Step the learning rate scheduler (linear decay)
         self.scheduler.step()
 
+        # Phase 3: Evaluate on fixed instances (no exploration)
         eval_stats = self.evaluate() if run_eval else {}
 
+        # Combine all metrics into one dict
         stats = {
             **rollout_stats,
             **eval_stats,
@@ -484,7 +750,10 @@ class MARLTrainer:
         self.epoch_stats.append(stats)
         self._write_csv(stats)
 
-        # Best-model tracking: use eval score if available, else training best
+        # --- Best Model Tracking ---
+        # Save the model whenever eval score improves (lower is better).
+        # This ensures we always have the best-performing policy saved,
+        # even if later training epochs regress.
         tracking_score = stats.get("eval_score", stats.get("best_score", float("inf")))
         if tracking_score < self.best_score:
             self.best_score = tracking_score
@@ -525,7 +794,20 @@ class MARLTrainer:
     # ------------------------------------------------------------------
 
     def save_checkpoint(self, path: str):
-        """Save model, optimizer, and normalization state."""
+        """Save full training state to a checkpoint file.
+
+        Saves EVERYTHING needed to resume training from exactly where we left off:
+          - Model weights (the learned policy)
+          - Optimizer state (Adam's momentum/variance estimates)
+          - LR scheduler state (current position in the decay schedule)
+          - FP16 scaler state (loss scaling factor)
+          - Reward normalization statistics (running mean/variance)
+          - Training history (all epoch stats)
+          - Best eval score (for best-model tracking)
+
+        Use with load_checkpoint() + --resume CLI flag to continue training
+        after interruptions (GPU quota exhaustion, accidental Ctrl+C, etc.)
+        """
         torch.save(
             {
                 "manager_state_dict": self.manager.state_dict(),
@@ -544,16 +826,28 @@ class MARLTrainer:
         )
 
     def load_checkpoint(self, path: str):
-        """Load checkpoint and restore all state."""
+        """Load a checkpoint and restore all training state.
+
+        Restores the model, optimizer, scheduler, scaler, reward normalization
+        statistics, training history, and best score. After calling this,
+        training can continue seamlessly from the checkpoint epoch.
+
+        Note: The reward_rms (running mean/std) restoration is critical —
+        without it, reward normalization would reset to zero, causing a
+        sudden shift in the gradient signal and destabilizing training.
+        """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.manager.load_state_dict(ckpt["manager_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler"])
         self.scaler.load_state_dict(ckpt["scaler"])
+
+        # Restore reward normalization statistics
         rms = ckpt["reward_rms"]
         self.reward_rms.mean = rms["mean"]
         self.reward_rms.var = rms["var"]
         self.reward_rms.count = rms["count"]
+
         self.epoch_stats = ckpt.get("epoch_stats", [])
         self.best_score = ckpt.get("best_score", float("inf"))

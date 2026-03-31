@@ -1,23 +1,33 @@
 """
 Stage 4 - Route Driver: Tactical Actor-Critic agent for local search operator selection.
 
-Consumes the (N, 128) node embeddings from Stage 1 (GNNEncoder) and produces
-a probability distribution over 4 local search operators. Called by CVRPEnv
-during INTENSIVE_POLISH steps to guide the solver's neighborhood search.
+*** THIS MODULE IS NOT USED IN THE CURRENT IMPLEMENTATION. ***
 
-Architecture:
-  1. Multi-Head Attention pooling: (N, 128) → (1, 128) tactical context vector
-  2. Actor-Critic MLP: (1, 128) → operator logits (4) + state value (1)
+It was originally designed to select which local search operators PyVRP should
+apply at each step (TWO_OPT, SWAP, RELOCATE, SWAP_STAR). However, PyVRP's
+solve() API runs its own internal operator selection and does not expose hooks
+for injecting external operator choices mid-solve. The Route Driver would require
+modifying PyVRP's C++ source code, which is outside the competition scope.
 
-The attention pooling learns to focus on "bottleneck" nodes — customers in
-tight clusters or near capacity boundaries — rather than treating all nodes
-equally (as global_mean_pool does in Stage 1).
+The current system uses only the Fleet Manager (agent_manager.py) to control
+solver PARAMETERS (penalty levels, random seeds), not individual operators.
 
-Action space (discrete, 4):
-  0 = TWO_OPT      — Reverse a sub-sequence within a route
-  1 = SWAP          — Exchange two customers between different routes
-  2 = RELOCATE      — Move a customer from one route to another
-  3 = SWAP_STAR     — Advanced cross-route exchange (most powerful HGS operator)
+This file is kept for reference in case future PyVRP versions expose operator
+selection APIs, or if we move to a custom solver implementation.
+
+Original design:
+  Consumes the (N, 128) node embeddings from Stage 1 (GNNEncoder) and produces
+  a probability distribution over 4 local search operators.
+
+  Architecture:
+    1. Multi-Head Attention pooling: (N, 128) → (1, 128) tactical context vector
+    2. Actor-Critic MLP: (1, 128) → operator logits (4) + state value (1)
+
+  Action space (discrete, 4):
+    0 = TWO_OPT      — Reverse a sub-sequence within a route
+    1 = SWAP          — Exchange two customers between different routes
+    2 = RELOCATE      — Move a customer from one route to another
+    3 = SWAP_STAR     — Advanced cross-route exchange (most powerful operator)
 """
 
 import torch

@@ -2,10 +2,23 @@
 ML4VRP 2026 - RL-Guided CVRP Solver
 Primary entry point: training loop and smoke tests.
 
+This file has two modes:
+  1. No arguments → runs all smoke tests to verify the pipeline works end-to-end
+  2. "train" subcommand → runs the full PPO training loop
+
+SMOKE TESTS verify each stage of the pipeline independently:
+  - Stage 1: GNN Encoder (single, batched, FP16)
+  - Stage 2: Fleet Manager (forward pass, action sampling, FP16)
+  - Stage 1+2: End-to-end pipeline (GNN → Fleet Manager)
+  - Stage 3: CVRPEnv (PyVRP wrapper with real solver)
+  - Stage 5: Training loop (2 PPO iterations on synthetic data)
+  - Stage 6: Action masking (NV_min calculation and mask enforcement)
+
 Usage:
     python -m src.main                                    # run all smoke tests
     python -m src.main train --instance_path data/ --epochs 100
     python -m src.main train --instance_path data/ --fp16 --gdrive_path /content/drive/MyDrive/ml4vrp
+    python -m src.main train --instance_path data/ --resume checkpoints/checkpoint_epoch10.pth --start_epoch 11
 """
 
 import argparse
@@ -453,7 +466,16 @@ def save_to_gdrive(src_path: pathlib.Path, gdrive_dir: str):
 
 
 def train(args):
-    """Run the PPO training loop for the Fleet Manager."""
+    """Run the PPO training loop for the Fleet Manager.
+
+    This sets up all components and runs the main training loop:
+      1. Load .vrp instance files from the dataset directory
+      2. Initialize the GNN Encoder (frozen — not trained by PPO)
+      3. Create the CVRPEnv (Gymnasium environment wrapping PyVRP)
+      4. Select 5 fixed evaluation instances for progress tracking
+      5. Create the MARLTrainer (PPO training engine)
+      6. Run the epoch loop with curriculum learning and checkpointing
+    """
     from src.model_vision import GNNEncoder
     from src.solver_engine import CVRPEnv
     from src.train import MARLTrainer, PPOConfig
@@ -461,7 +483,8 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Collect instance files
+    # --- Load Dataset ---
+    # Supports both a single .vrp file and a directory of .vrp files
     instance_dir = pathlib.Path(args.instance_path)
     if instance_dir.is_file():
         instance_paths = [instance_dir]
@@ -470,9 +493,17 @@ def train(args):
     assert len(instance_paths) > 0, f"No .vrp files found at {args.instance_path}"
     print(f"Instances: {len(instance_paths)}")
 
+    # --- Initialize GNN Encoder ---
+    # The encoder is NOT trained by PPO — it's used in eval mode to produce
+    # graph embeddings at the start of each episode. Its weights are randomly
+    # initialized and stay fixed throughout training.
     encoder = GNNEncoder().to(device)
     encoder.eval()
 
+    # --- Create Environment ---
+    # CVRPEnv wraps PyVRP and implements the Gymnasium interface.
+    # Curriculum learning: start with small instances (N<=100) for the first
+    # curriculum_epochs, then unlock all instances (up to 400 nodes).
     env = CVRPEnv(
         instance_paths=[str(p) for p in instance_paths],
         encoder=encoder,
@@ -482,7 +513,9 @@ def train(args):
     if args.curriculum_epochs > 0:
         print(f"Curriculum: N<=100 for first {args.curriculum_epochs} epochs, then all")
 
-    # Select fixed evaluation instances
+    # --- Select Fixed Evaluation Instances ---
+    # Pick 5 evenly-spaced instances from the sorted dataset for consistent
+    # progress tracking. These same 5 instances are used every epoch.
     eval_instances = []
     if args.eval_instances:
         eval_instances = [str(p) for p in pathlib.Path(args.eval_instances).glob("*.vrp")]
@@ -510,7 +543,9 @@ def train(args):
     checkpoint_dir = pathlib.Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resume from checkpoint if provided
+    # --- Resume from Checkpoint (if provided) ---
+    # Restores model weights, optimizer state, LR schedule, reward normalization,
+    # and best score. Used after GPU quota exhaustion or accidental interruption.
     start_epoch = args.start_epoch
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
@@ -518,10 +553,17 @@ def train(args):
         print(f"  Loaded. best_score={trainer.best_score:.0f}, starting at epoch {start_epoch}")
 
     print(f"Training for {args.epochs} epochs (starting at {start_epoch}), {args.episodes_per_epoch} episodes/epoch...")
+
+    # --- Curriculum Learning ---
+    # If resuming past the curriculum boundary, immediately unlock all instances.
+    # Otherwise, start with small instances and expand at curriculum_epochs+1.
     curriculum_expanded = start_epoch > args.curriculum_epochs
     if curriculum_expanded:
         env.set_max_nodes(None)
+
+    # --- Main Training Loop ---
     for epoch in range(start_epoch, args.epochs + 1):
+        # Check if it's time to expand the curriculum (unlock larger instances)
         if not curriculum_expanded and epoch > args.curriculum_epochs and args.curriculum_epochs > 0:
             env.set_max_nodes(None)
             curriculum_expanded = True
