@@ -1,0 +1,10 @@
+torch>=2.0
+torch-geometric
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
+pyvrp
+gymnasium
+numpy
+matplotlib

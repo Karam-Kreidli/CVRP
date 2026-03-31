@@ -510,9 +510,18 @@ def train(args):
     checkpoint_dir = pathlib.Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Training for {args.epochs} epochs, {args.episodes_per_epoch} episodes/epoch...")
-    curriculum_expanded = False
-    for epoch in range(1, args.epochs + 1):
+    # Resume from checkpoint if provided
+    start_epoch = args.start_epoch
+    if args.resume:
+        print(f"Resuming from checkpoint: {args.resume}")
+        trainer.load_checkpoint(args.resume)
+        print(f"  Loaded. best_score={trainer.best_score:.0f}, starting at epoch {start_epoch}")
+
+    print(f"Training for {args.epochs} epochs (starting at {start_epoch}), {args.episodes_per_epoch} episodes/epoch...")
+    curriculum_expanded = start_epoch > args.curriculum_epochs
+    if curriculum_expanded:
+        env.set_max_nodes(None)
+    for epoch in range(start_epoch, args.epochs + 1):
         if not curriculum_expanded and epoch > args.curriculum_epochs and args.curriculum_epochs > 0:
             env.set_max_nodes(None)
             curriculum_expanded = True
@@ -575,6 +584,10 @@ def parse_args():
                      help="Google Drive directory for checkpoint backup")
     tp.add_argument("--curriculum_epochs", type=int, default=20,
                      help="Epochs to restrict to small instances before expanding")
+    tp.add_argument("--resume", type=str, default=None,
+                     help="Path to checkpoint .pth file to resume training from")
+    tp.add_argument("--start_epoch", type=int, default=1,
+                     help="Epoch number to start from (for resumed runs)")
 
     return parser.parse_args()
 
