@@ -19,6 +19,7 @@ Usage:
 import argparse
 import math
 import pathlib
+import time
 
 import numpy as np
 import hygese as hgs
@@ -173,13 +174,18 @@ def main():
 
     all_default_scores = []
     all_large_scores = []
+    baseline_start = time.time()
 
-    for inst_path in eval_instances:
+    for inst_idx, inst_path in enumerate(eval_instances):
+        inst_t0 = time.time()
         data = parse_vrp_file(inst_path)
 
         # Run multiple seeds, each with num_steps solves, keep the best
         best_default = {"score": float("inf")}
         best_large = {"score": float("inf")}
+
+        total_solves = args.num_seeds * args.num_steps
+        solve_count = 0
 
         for s in range(args.num_seeds):
             seed = 42 + s * 1000
@@ -189,20 +195,34 @@ def main():
                 res = run_default_baseline(data, args.nb_iter, step_seed)
                 if res["score"] < best_default["score"]:
                     best_default = res
+                solve_count += 1
 
             for step in range(args.num_steps):
                 step_seed = seed + step
                 res = run_large_pop_baseline(data, args.nb_iter, step_seed)
                 if res["score"] < best_large["score"]:
                     best_large = res
+                solve_count += 1
+
+            print(
+                f"  {inst_path.stem} seed {s+1}/{args.num_seeds}: "
+                f"default={best_default['score']:.0f}, large={best_large['score']:.0f}"
+            )
 
         all_default_scores.append(best_default["score"])
         all_large_scores.append(best_large["score"])
+
+        inst_elapsed = time.time() - inst_t0
+        im, isec = divmod(int(inst_elapsed), 60)
+        remaining = len(eval_instances) - (inst_idx + 1)
+        eta_sec = inst_elapsed * remaining
+        eta_m, eta_s = divmod(int(eta_sec), 60)
 
         print(
             f"{inst_path.stem:<25s} "
             f"{best_default['nv']:>5d} {best_default['td']:>10.0f} {best_default['score']:>10.0f}   "
             f"{best_large['nv']:>5d} {best_large['td']:>10.0f} {best_large['score']:>10.0f}"
+            f"   ({im}m{isec:02d}s, ETA: {eta_m}m{eta_s:02d}s)"
         )
 
     print(sep)
@@ -212,6 +232,10 @@ def main():
         f"{'':>5s} {'':>10s} {np.mean(all_large_scores):>10.0f}"
     )
     print("=" * 95)
+    print()
+    total_time = time.time() - baseline_start
+    tm, ts = divmod(int(total_time), 60)
+    print(f"Baseline evaluation completed in {tm}m{ts:02d}s.")
     print()
     print("Compare these averages against your RL agent's Eval score.")
     print("If RL Eval < Default Average, the RL agent is adding value.")
