@@ -52,8 +52,8 @@ EMBED_DIM = 128          # Graph embedding dimension (from GNN Encoder)
 STATS_DIM = 4            # Solver statistics: [time_ratio, nv_ratio, score_ratio, stagnation]
 OBS_DIM = EMBED_DIM + STATS_DIM  # 132 = total observation dimension for the agent
 NUM_ACTIONS = 7          # Number of discrete strategy choices
-ITERS_PER_STEP = 5_000   # HGS iterations (nbIter) per environment step
-MAX_STEPS = 20           # Steps per episode
+ITERS_PER_STEP = 2_000   # HGS iterations (nbIter) per environment step
+MAX_STEPS = 10           # Steps per episode
 TIME_PER_STEP = 0.0      # HGS time limit per step (0 = use nbIter only)
 
 ACTION_NAMES = [

@@ -27,6 +27,9 @@ logs/
 checkpoints/
 *.pth
 
+# Dataset (downloaded at runtime via setup_vm.sh)
+data/
+
 # Temp/scratch files from earlier development
 *.bat
 *.txt

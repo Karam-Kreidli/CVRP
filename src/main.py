@@ -647,13 +647,13 @@ def parse_args():
     sub = parser.add_subparsers(dest="mode")
 
     tp = sub.add_parser("train", help="Run PPO training")
-    tp.add_argument("--epochs", type=int, default=100)
+    tp.add_argument("--epochs", type=int, default=50)
     tp.add_argument("--batch_size", type=int, default=64)
     tp.add_argument("--instance_path", type=str, required=True,
                      help="Path to .vrp file or directory of .vrp files")
     tp.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     tp.add_argument("--save_interval", type=int, default=10)
-    tp.add_argument("--episodes_per_epoch", type=int, default=8,
+    tp.add_argument("--episodes_per_epoch", type=int, default=4,
                      help="Episodes per epoch (more = stabler gradients)")
     tp.add_argument("--eval_instances", type=str, default=None,
                      help="Directory of .vrp files for fixed evaluation")
