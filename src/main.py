@@ -10,7 +10,7 @@ SMOKE TESTS verify each stage of the pipeline independently:
   - Stage 1: GNN Encoder (single, batched, FP16)
   - Stage 2: Fleet Manager (forward pass, action sampling, FP16)
   - Stage 1+2: End-to-end pipeline (GNN → Fleet Manager)
-  - Stage 3: CVRPEnv (PyVRP wrapper with real solver)
+  - Stage 3: CVRPEnv (HGS-CVRP wrapper with real solver)
   - Stage 5: Training loop (2 PPO iterations on synthetic data)
   - Stage 6: Action masking (NV_min calculation and mask enforcement)
 
@@ -112,7 +112,7 @@ def smoke_test_batched():
 
 
 def smoke_test_fleet_manager():
-    """Verify FleetManager forward pass with 6 actions."""
+    """Verify FleetManager forward pass with 7 actions."""
     from src.agent_manager import FleetManager, NUM_FLEET_ACTIONS
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -254,9 +254,9 @@ EOF
     assert obs.shape == (132,), f"Expected (132,), got {obs.shape}"
     print(f"  Reset -> NV={info['nv']}, TD={info['td']:.0f}, score={info['score']:.0f}")
 
-    # Step through actions 0, 1, 4 (POLISH, MILD_PRESSURE, EXPLORE_NEW_SEED)
+    # Step through actions 0, 2, 6 (DEFAULT, LARGE_DIVERSE, EXPLORE_NEW_SEED)
     total_reward = 0.0
-    for action in [0, 1, 4]:
+    for action in [0, 2, 6]:
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         assert obs.shape == (132,)
@@ -348,7 +348,7 @@ def smoke_test_training():
 
 
 def smoke_test_action_masking():
-    """Verify NV_min calculation and action masking with 6-action space."""
+    """Verify NV_min calculation and action masking with 7-action space."""
     import tempfile
     import os
     from src.model_vision import GNNEncoder
@@ -425,27 +425,27 @@ EOF
     graph_emb = torch.tensor(obs[:128], dtype=torch.float32, device=device).unsqueeze(0)
     stats = torch.tensor(obs[128:], dtype=torch.float32, device=device).unsqueeze(0)
 
-    # Force mask: block all pressure actions (1,2,3,5)
+    # Force mask: block aggressive actions (1=FAST_AGGRESSIVE, 4=HIGH_TURNOVER)
     forced_mask = torch.tensor(
-        [[True, False, False, False, True, False]], dtype=torch.bool, device=device
+        [[True, False, True, True, False, True, True]], dtype=torch.bool, device=device
     )
     with torch.no_grad():
         logits, _ = manager(graph_emb, stats, action_mask=forced_mask)
 
-    for blocked in [1, 2, 3, 5]:
+    for blocked in [1, 4]:
         assert logits[0, blocked].item() < -1e3, \
             f"Action {blocked} logit should be masked, got {logits[0, blocked].item()}"
 
-    # Sample 100 actions with mask — none should be pressure actions
+    # Sample 100 actions with mask — none should be blocked actions
     actions = []
     for _ in range(100):
         with torch.no_grad():
             a, _, _ = manager.select_action(graph_emb, stats, action_mask=forced_mask)
         actions.append(a.item())
-    blocked_set = {1, 2, 3, 5}
+    blocked_set = {1, 4}
     sampled_blocked = blocked_set & set(actions)
     assert not sampled_blocked, f"Blocked actions {sampled_blocked} were sampled despite mask!"
-    print(f"  100 masked samples: {set(actions)} (pressure actions never sampled)")
+    print(f"  100 masked samples: {set(actions)} (aggressive actions never sampled)")
 
     os.remove(vrp_path)
     os.rmdir(tmpdir)
@@ -646,13 +646,13 @@ if __name__ == "__main__":
         smoke_test_fp16()
         print("\n=== Stage 1: Batched (variable sizes) ===")
         smoke_test_batched()
-        print("\n=== Stage 2: Fleet Manager (6 actions) ===")
+        print("\n=== Stage 2: Fleet Manager (7 actions) ===")
         smoke_test_fleet_manager()
         print("\n=== Stage 2: Fleet Manager FP16 ===")
         smoke_test_fleet_manager_fp16()
         print("\n=== Stage 1+2: End-to-End Pipeline ===")
         smoke_test_pipeline()
-        print("\n=== Stage 3: CVRPEnv (PyVRP wrapper, 6 actions) ===")
+        print("\n=== Stage 3: CVRPEnv (HGS-CVRP wrapper, 7 actions) ===")
         smoke_test_cvrp_env()
         print("\n=== Stage 5: Training (2 PPO iterations) ===")
         smoke_test_training()

@@ -9,7 +9,7 @@ WHAT IT DOES:
   At each of the 20 steps in an episode, the Fleet Manager looks at:
     1. The instance embedding (128-dim vector from the GNN — "what does this problem look like?")
     2. Four real-time statistics from the solver ("how is the search going?")
-  And chooses one of 6 search strategies for the next 1000 solver iterations.
+  And chooses one of 7 HGS parameter configurations for the next solve.
 
 WHY THIS MATTERS:
   The competition score is 1000*NV + TD. Removing one vehicle saves 1000 distance
@@ -27,12 +27,13 @@ OBSERVATION (what the agent sees):
     - stagnation_ratio: iters_no_improve / budget  ("Am I stuck?")
 
 ACTION SPACE (what the agent can do):
-  0 = POLISH             — Default solver params, just optimize routes
-  1 = MILD_PRESSURE      — Gentle penalty increase (2x) to nudge fewer vehicles
-  2 = MODERATE_PRESSURE  — Steady penalty increase (5x) for reliable fleet reduction
-  3 = AGGRESSIVE_PRESSURE — Heavy penalty (10x) to force route merges
-  4 = EXPLORE_NEW_SEED   — New random seed, default params (escape local optima)
-  5 = EXPLORE_PRESSURE   — New seed + moderate penalty (escape AND reduce)
+  0 = DEFAULT            — Standard HGS parameters (the baseline)
+  1 = FAST_AGGRESSIVE    — Small pop, low granularity, low feasibility (speed + pressure)
+  2 = LARGE_DIVERSE      — Big population, high granularity, relaxed feasibility
+  3 = DEEP_SEARCH        — Default pop, very high granularity (deep local search)
+  4 = HIGH_TURNOVER      — Tiny base pop, huge offspring, very low feasibility
+  5 = STABLE_ELITE       — Large base pop, fewer offspring, high feasibility
+  6 = EXPLORE_NEW_SEED   — Default params with a fresh random seed
 
 ARCHITECTURE: Actor-Critic
   The network has two "heads" sharing a common trunk:
@@ -54,12 +55,12 @@ from torch.distributions import Categorical
 SOLVER_STATS_DIM = 4  # [time_ratio, nv_ratio, violation_ratio, stagnation_ratio]
 
 # Total number of discrete strategy choices available to the agent
-NUM_FLEET_ACTIONS = 6
+NUM_FLEET_ACTIONS = 7
 
 # Human-readable names for each action (used in logging and debugging)
 ACTION_NAMES = [
-    "POLISH", "MILD_PRESSURE", "MODERATE_PRESSURE",
-    "AGGRESSIVE_PRESSURE", "EXPLORE_NEW_SEED", "EXPLORE_PRESSURE",
+    "DEFAULT", "FAST_AGGRESSIVE", "LARGE_DIVERSE",
+    "DEEP_SEARCH", "HIGH_TURNOVER", "STABLE_ELITE", "EXPLORE_NEW_SEED",
 ]
 
 
