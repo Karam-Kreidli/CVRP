@@ -63,7 +63,6 @@ The web app calls this on startup to show the green "SYSTEM READY" dot in the si
 | `total_training_epochs` | int | How many PPO training epochs have completed so far. |
 | `best_score_ever` | float | The lowest `1000×NV + TD` score achieved across all training runs. |
 
-
 ---
 
 ## Endpoint 2 — Start a Solver Job
@@ -612,6 +611,111 @@ Called when the user clicks the **Stop** button in the Solver Console. Should gr
 
 ---
 
+## Endpoint 7 — Start a Benchmark Job
+
+```
+POST /benchmark
+Content-Type: multipart/form-data
+```
+
+Runs HGS Default and HGS Large Population on the uploaded instance using the same iteration budget as the main solve. The RL result is passed in from the client (already computed by `/solve`) so we don't re-run it.
+
+**Request fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `file` | file | Yes | The `.vrp` instance file |
+| `rl_job_id` | string | No | `job_id` of the completed RL solve |
+| `rl_score` | float | No | Best score from the RL solve (`1000×NV + TD`) |
+| `rl_nv` | int | No | Best NV from the RL solve |
+| `rl_td` | float | No | Best TD from the RL solve |
+
+If `rl_score` / `rl_nv` / `rl_td` are provided, include them verbatim in the response under the `"RouteIQ RL"` comparison entry. Otherwise run the RL pipeline fresh (same as `/solve`, competition mode).
+
+**Response `202 Accepted`:**
+```json
+{
+  "benchmark_id": "bm_a3f9c2b1"
+}
+```
+
+---
+
+## Endpoint 8 — Poll Benchmark Status / Result
+
+```
+GET /benchmark/{benchmark_id}
+```
+
+Called **every second** by the Flutter app while the benchmark is running. Returns `"complete"` plus the full comparisons array once both baselines finish.
+
+**Response `200` (running):**
+```json
+{
+  "benchmark_id": "bm_a3f9c2b1",
+  "status": "running",
+  "message": "Running HGS Large Population (stage 2/2)..."
+}
+```
+
+**Response `200` (complete):**
+```json
+{
+  "benchmark_id": "bm_a3f9c2b1",
+  "instance_name": "X-n101-k25",
+  "status": "complete",
+  "comparisons": [
+    {
+      "name": "RouteIQ RL",
+      "nv": 26,
+      "td": 28702.7,
+      "score": 54702.7,
+      "solve_time_seconds": 106
+    },
+    {
+      "name": "HGS Default",
+      "nv": 29,
+      "td": 31204.8,
+      "score": 60204.8,
+      "solve_time_seconds": 60
+    },
+    {
+      "name": "HGS Large Pop",
+      "nv": 28,
+      "td": 30100.0,
+      "score": 58100.0,
+      "solve_time_seconds": 120
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `comparisons[].name` | string | `"RouteIQ RL"`, `"HGS Default"`, or `"HGS Large Pop"` |
+| `comparisons[].nv` | int | Vehicles used |
+| `comparisons[].td` | float | Total distance |
+| `comparisons[].score` | float | `1000 × nv + td` |
+| `comparisons[].solve_time_seconds` | int | Wall time for this solver |
+
+**Convention:** Always return `"RouteIQ RL"` as the first element so the Flutter app can use `comparisons.first` as the RL reference.
+
+**Response `200` (error):**
+```json
+{
+  "benchmark_id": "bm_a3f9c2b1",
+  "status": "error",
+  "message": "HGS solver crashed on stage 2"
+}
+```
+
+**Response `404`:**
+```json
+{ "error": "Not found" }
+```
+
+---
+
 ## Summary Table
 
 | # | Method | Endpoint | Used By | When |
@@ -622,6 +726,8 @@ Called when the user clicks the **Stop** button in the Solver Console. Should gr
 | 4 | `GET` | `/result/{job_id}` | Solution Viewer screen | Once job completes |
 | 5 | `GET` | `/runs` | Dashboard — recent runs table + chart | Dashboard load |
 | 6 | `POST` | `/stop/{job_id}` | Solver Console — Stop button | User clicks Stop |
+| 7 | `POST` | `/benchmark` | Benchmark screen — Run Benchmark button | User clicks Run Benchmark |
+| 8 | `GET` | `/benchmark/{benchmark_id}` | Benchmark screen — live polling | Every 1s while benchmark runs |
 
 ---
 
@@ -676,6 +782,100 @@ def on_step(info: dict, stage: int, log_msg: str):
     jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]  # keep last 10
 ```
 
+### Benchmark state storage and background runner
+
+Benchmark jobs use a separate in-memory store keyed by `benchmark_id`. The pattern mirrors the `/solve` background thread approach:
+
+```python
+import threading
+from uuid import uuid4
+
+benchmarks: dict[str, dict] = {}
+
+def run_benchmark_background(benchmark_id: str, vrp_path: str,
+                              rl_nv: int, rl_td: float, rl_time: int):
+    try:
+        # ── HGS Default ───────────────────────────────────────────────────
+        benchmarks[benchmark_id]["message"] = "Running HGS Default (stage 1/2)..."
+        hgs_default_result = run_hgs(vrp_path, population_size=20)
+
+        # ── HGS Large Population ──────────────────────────────────────────
+        benchmarks[benchmark_id]["message"] = "Running HGS Large Population (stage 2/2)..."
+        hgs_large_result = run_hgs(vrp_path, population_size=100)
+
+        benchmarks[benchmark_id]["comparisons"] = [
+            {
+                "name": "RouteIQ RL",
+                "nv": rl_nv,
+                "td": rl_td,
+                "score": 1000 * rl_nv + rl_td,
+                "solve_time_seconds": rl_time,
+            },
+            {
+                "name": "HGS Default",
+                "nv": hgs_default_result.nv,
+                "td": hgs_default_result.td,
+                "score": 1000 * hgs_default_result.nv + hgs_default_result.td,
+                "solve_time_seconds": hgs_default_result.time,
+            },
+            {
+                "name": "HGS Large Pop",
+                "nv": hgs_large_result.nv,
+                "td": hgs_large_result.td,
+                "score": 1000 * hgs_large_result.nv + hgs_large_result.td,
+                "solve_time_seconds": hgs_large_result.time,
+            },
+        ]
+        benchmarks[benchmark_id]["status"] = "complete"
+
+    except Exception as e:
+        benchmarks[benchmark_id]["status"] = "error"
+        benchmarks[benchmark_id]["message"] = str(e)
+
+
+@app.post("/benchmark")
+async def start_benchmark(
+    file: UploadFile,
+    rl_nv: int = Form(0),
+    rl_td: float = Form(0.0),
+    rl_score: float = Form(0.0),
+    rl_job_id: str = Form(""),
+):
+    benchmark_id = "bm_" + uuid4().hex[:8]
+    vrp_path = f"/tmp/{benchmark_id}.vrp"
+
+    with open(vrp_path, "wb") as f:
+        f.write(await file.read())
+
+    benchmarks[benchmark_id] = {
+        "status": "running",
+        "message": "Starting benchmark...",
+        "comparisons": [],
+    }
+
+    threading.Thread(
+        target=run_benchmark_background,
+        args=(benchmark_id, vrp_path, rl_nv, rl_td, 0),
+        daemon=True,
+    ).start()
+
+    return JSONResponse(status_code=202, content={"benchmark_id": benchmark_id})
+
+
+@app.get("/benchmark/{benchmark_id}")
+def get_benchmark(benchmark_id: str):
+    bm = benchmarks.get(benchmark_id)
+    if bm is None:
+        return JSONResponse(status_code=404, content={"error": "Not found"})
+
+    response = {"benchmark_id": benchmark_id, **bm}
+
+    if bm["status"] == "complete":
+        response["instance_name"] = benchmark_id  # replace with real parsed name
+
+    return response
+```
+
 ---
 
-*ML4VRP 2026 — GECCO Competition · API Spec v2.0*
+*ML4VRP 2026 — GECCO Competition · API Spec v2.1*
