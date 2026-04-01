@@ -24,6 +24,7 @@ Usage:
 import argparse
 import pathlib
 import shutil
+import time
 
 import torch
 
@@ -562,7 +563,14 @@ def train(args):
         env.set_max_nodes(None)
 
     # --- Main Training Loop ---
+    epoch_times = []
+    best_eval_so_far = float("inf")
+    epochs_since_improvement = 0
+    train_start = time.time()
+
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_t0 = time.time()
+
         # Check if it's time to expand the curriculum (unlock larger instances)
         if not curriculum_expanded and epoch > args.curriculum_epochs and args.curriculum_epochs > 0:
             env.set_max_nodes(None)
@@ -571,18 +579,49 @@ def train(args):
 
         stats = trainer.train_epoch(num_episodes=args.episodes_per_epoch)
 
+        # --- Timing ---
+        epoch_elapsed = time.time() - epoch_t0
+        epoch_times.append(epoch_elapsed)
+        avg_epoch_time = sum(epoch_times) / len(epoch_times)
+        remaining_epochs = args.epochs - epoch
+        eta_seconds = avg_epoch_time * remaining_epochs
+        eta_h, eta_rem = divmod(int(eta_seconds), 3600)
+        eta_m = eta_rem // 60
+        ep_m, ep_s = divmod(int(epoch_elapsed), 60)
+
+        # --- Best eval tracking ---
         eval_str = ""
+        is_new_best = False
         if "eval_score" in stats:
-            eval_str = f" | Eval: {stats['eval_score']:>8.0f}"
+            eval_score = stats["eval_score"]
+            if eval_score < best_eval_so_far:
+                best_eval_so_far = eval_score
+                epochs_since_improvement = 0
+                is_new_best = True
+            else:
+                epochs_since_improvement += 1
+            best_tag = " *BEST*" if is_new_best else ""
+            eval_str = f" | Eval: {eval_score:>8.0f}{best_tag}"
+
+        total_elapsed = time.time() - train_start
+        te_h, te_rem = divmod(int(total_elapsed), 3600)
+        te_m = te_rem // 60
+
         print(
             f"[{epoch:>4d}/{args.epochs}] "
-            f"AvgScore: {stats['avg_score']:>8.0f} | "
-            f"AvgNV: {stats['avg_nv']:>5.1f} | "
-            f"AvgTD: {stats['avg_td']:>8.0f}{eval_str} | "
-            f"PL: {stats['policy_loss']:>7.4f} | "
+            f"AvgScore: {stats['avg_score']:>8.0f}{eval_str} | "
             f"Ent: {stats['entropy']:.3f} | "
-            f"LR: {stats['lr']:.1e}"
+            f"{ep_m}m{ep_s:02d}s/epoch | "
+            f"ETA: {eta_h}h{eta_m:02d}m | "
+            f"Elapsed: {te_h}h{te_m:02d}m"
         )
+
+        # --- Early warning ---
+        if epochs_since_improvement >= 15:
+            print(
+                f"  WARNING: No eval improvement for {epochs_since_improvement} epochs. "
+                f"Best eval: {best_eval_so_far:.0f}. Consider stopping if no progress soon."
+            )
 
         if epoch % args.save_interval == 0:
             ckpt = checkpoint_dir / f"checkpoint_epoch{epoch}.pth"
@@ -593,7 +632,10 @@ def train(args):
 
     final = checkpoint_dir / "checkpoint_final.pth"
     trainer.save_checkpoint(str(final))
-    print(f"Training complete. Final checkpoint: {final}")
+    total_time = time.time() - train_start
+    tt_h, tt_rem = divmod(int(total_time), 3600)
+    tt_m = tt_rem // 60
+    print(f"Training complete in {tt_h}h{tt_m:02d}m. Final checkpoint: {final}")
     if args.gdrive_path:
         save_to_gdrive(final, args.gdrive_path)
 

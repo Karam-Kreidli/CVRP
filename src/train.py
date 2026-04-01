@@ -34,6 +34,7 @@ import csv
 import math
 import pathlib
 import shutil
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -468,7 +469,8 @@ class MARLTrainer:
         episode_nvs = []
         episode_tds = []
 
-        for _ in range(num_episodes):
+        for ep_idx in range(num_episodes):
+            ep_t0 = time.time()
             obs, info = self.env.reset()      # Random instance, initial solve
             action_mask = info.get("action_mask")
             done = False
@@ -519,6 +521,16 @@ class MARLTrainer:
             episode_scores.append(info.get("score", 0.0))
             episode_nvs.append(info.get("nv", 0))
             episode_tds.append(info.get("td", 0.0))
+
+            ep_elapsed = time.time() - ep_t0
+            ep_mins, ep_secs = divmod(int(ep_elapsed), 60)
+            print(
+                f"  Episode {ep_idx+1}/{num_episodes}: "
+                f"score={info.get('score', 0.0):.0f}, "
+                f"nv={info.get('nv', 0)}, "
+                f"td={info.get('td', 0.0):.0f} "
+                f"({ep_mins}m{ep_secs:02d}s)"
+            )
 
         # --- Reward Normalization ---
         # Update running mean/std with this epoch's raw rewards, then normalize
