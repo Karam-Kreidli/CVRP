@@ -63,6 +63,7 @@ The web app calls this on startup to show the green "SYSTEM READY" dot in the si
 | `total_training_epochs` | int | How many PPO training epochs have completed so far. |
 | `best_score_ever` | float | The lowest `1000×NV + TD` score achieved across all training runs. |
 
+
 ---
 
 ## Endpoint 2 — Start a Solver Job
@@ -618,19 +619,23 @@ POST /benchmark
 Content-Type: multipart/form-data
 ```
 
-Runs HGS Default and HGS Large Population on the uploaded instance using the same iteration budget as the main solve. The RL result is passed in from the client (already computed by `/solve`) so we don't re-run it.
+Runs HGS Default and HGS Large Population on the uploaded instance using
+the same iteration budget as the main solve. The RL result is passed in
+from the client (already computed by /solve) so we don't re-run it.
 
 **Request fields:**
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `file` | file | Yes | The `.vrp` instance file |
-| `rl_job_id` | string | No | `job_id` of the completed RL solve |
-| `rl_score` | float | No | Best score from the RL solve (`1000×NV + TD`) |
-| `rl_nv` | int | No | Best NV from the RL solve |
-| `rl_td` | float | No | Best TD from the RL solve |
+| Field              | Type   | Required | Description                                      |
+|--------------------|--------|----------|--------------------------------------------------|
+| `file`             | file   | Yes      | The .vrp instance file                           |
+| `rl_job_id`        | string | No       | job_id of the completed RL solve                 |
+| `rl_score`         | float  | No       | Best score from the RL solve (1000×NV + TD)      |
+| `rl_nv`            | int    | No       | Best NV from the RL solve                        |
+| `rl_td`            | float  | No       | Best TD from the RL solve                        |
 
-If `rl_score` / `rl_nv` / `rl_td` are provided, include them verbatim in the response under the `"RouteIQ RL"` comparison entry. Otherwise run the RL pipeline fresh (same as `/solve`, competition mode).
+If `rl_score` / `rl_nv` / `rl_td` are provided, include them verbatim in
+the response under the "RouteIQ RL" comparison entry. Otherwise run the
+RL pipeline fresh (same as /solve, competition mode).
 
 **Response `202 Accepted`:**
 ```json
@@ -647,7 +652,8 @@ If `rl_score` / `rl_nv` / `rl_td` are provided, include them verbatim in the res
 GET /benchmark/{benchmark_id}
 ```
 
-Called **every second** by the Flutter app while the benchmark is running. Returns `"complete"` plus the full comparisons array once both baselines finish.
+Called every second by the Flutter app while the benchmark is running.
+Returns `"complete"` plus the full comparisons array once both baselines finish.
 
 **Response `200` (running):**
 ```json
@@ -690,15 +696,16 @@ Called **every second** by the Flutter app while the benchmark is running. Retur
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `comparisons[].name` | string | `"RouteIQ RL"`, `"HGS Default"`, or `"HGS Large Pop"` |
-| `comparisons[].nv` | int | Vehicles used |
-| `comparisons[].td` | float | Total distance |
-| `comparisons[].score` | float | `1000 × nv + td` |
-| `comparisons[].solve_time_seconds` | int | Wall time for this solver |
+| Field                        | Type    | Description                                      |
+|------------------------------|---------|--------------------------------------------------|
+| `comparisons[].name`         | string  | "RouteIQ RL", "HGS Default", or "HGS Large Pop" |
+| `comparisons[].nv`           | int     | Vehicles used                                    |
+| `comparisons[].td`           | float   | Total distance                                   |
+| `comparisons[].score`        | float   | 1000 × nv + td                                   |
+| `comparisons[].solve_time_seconds` | int | Wall time for this solver              |
 
-**Convention:** Always return `"RouteIQ RL"` as the first element so the Flutter app can use `comparisons.first` as the RL reference.
+**Convention:** Always return "RouteIQ RL" as the first element so the
+Flutter app can use `comparisons.first` as the RL reference.
 
 **Response `200` (error):**
 ```json
@@ -707,11 +714,6 @@ Called **every second** by the Flutter app while the benchmark is running. Retur
   "status": "error",
   "message": "HGS solver crashed on stage 2"
 }
-```
-
-**Response `404`:**
-```json
-{ "error": "Not found" }
 ```
 
 ---
@@ -726,8 +728,6 @@ Called **every second** by the Flutter app while the benchmark is running. Retur
 | 4 | `GET` | `/result/{job_id}` | Solution Viewer screen | Once job completes |
 | 5 | `GET` | `/runs` | Dashboard — recent runs table + chart | Dashboard load |
 | 6 | `POST` | `/stop/{job_id}` | Solver Console — Stop button | User clicks Stop |
-| 7 | `POST` | `/benchmark` | Benchmark screen — Run Benchmark button | User clicks Run Benchmark |
-| 8 | `GET` | `/benchmark/{benchmark_id}` | Benchmark screen — live polling | Every 1s while benchmark runs |
 
 ---
 
@@ -782,100 +782,153 @@ def on_step(info: dict, stage: int, log_msg: str):
     jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]  # keep last 10
 ```
 
-### Benchmark state storage and background runner
+---
 
-Benchmark jobs use a separate in-memory store keyed by `benchmark_id`. The pattern mirrors the `/solve` background thread approach:
+*ML4VRP 2026 — GECCO Competition · API Spec v2.0*
 
-```python
-import threading
-from uuid import uuid4
+---
 
-benchmarks: dict[str, dict] = {}
+## Endpoint 7 — Benchmark Comparison ← NEW
 
-def run_benchmark_background(benchmark_id: str, vrp_path: str,
-                              rl_nv: int, rl_td: float, rl_time: int):
-    try:
-        # ── HGS Default ───────────────────────────────────────────────────
-        benchmarks[benchmark_id]["message"] = "Running HGS Default (stage 1/2)..."
-        hgs_default_result = run_hgs(vrp_path, population_size=20)
+```
+GET /benchmark/{job_id}
+```
 
-        # ── HGS Large Population ──────────────────────────────────────────
-        benchmarks[benchmark_id]["message"] = "Running HGS Large Population (stage 2/2)..."
-        hgs_large_result = run_hgs(vrp_path, population_size=100)
+Called by the **Benchmark page** after a solve job completes. Runs PyVRP Default and PyVRP Large Population on the **same instance file** that was already uploaded for the RL solve job (identified by `job_id`). Returns a 3-way comparison.
 
-        benchmarks[benchmark_id]["comparisons"] = [
-            {
-                "name": "RouteIQ RL",
-                "nv": rl_nv,
-                "td": rl_td,
-                "score": 1000 * rl_nv + rl_td,
-                "solve_time_seconds": rl_time,
-            },
-            {
-                "name": "HGS Default",
-                "nv": hgs_default_result.nv,
-                "td": hgs_default_result.td,
-                "score": 1000 * hgs_default_result.nv + hgs_default_result.td,
-                "solve_time_seconds": hgs_default_result.time,
-            },
-            {
-                "name": "HGS Large Pop",
-                "nv": hgs_large_result.nv,
-                "td": hgs_large_result.td,
-                "score": 1000 * hgs_large_result.nv + hgs_large_result.td,
-                "solve_time_seconds": hgs_large_result.time,
-            },
-        ]
-        benchmarks[benchmark_id]["status"] = "complete"
+**Why this endpoint, not a new file upload?**
+The `.vrp` file is already on the server from the original `POST /solve` call. Reusing `job_id` avoids uploading the file twice and guarantees both algorithms are tested on the identical input.
 
-    except Exception as e:
-        benchmarks[benchmark_id]["status"] = "error"
-        benchmarks[benchmark_id]["message"] = str(e)
+**When to call it:**
+The Flutter app calls this once after `GET /status/{job_id}` returns `"status": "complete"`. The benchmark computation runs in the background and may take a few seconds. Return HTTP 425 while still computing.
 
+**Response `200 OK`**
+```json
+{
+  "job_id": "a3f9c2b1",
+  "instance_name": "X-n101-k25",
+  "num_nodes": 101,
+  "rl": {
+    "nv": 26,
+    "td": 28702.7,
+    "score": 54702.7,
+    "solve_time_seconds": 106
+  },
+  "hgs_default": {
+    "nv": 29,
+    "td": 31840.5,
+    "score": 60840.5,
+    "solve_time_seconds": 60
+  },
+  "hgs_large_pop": {
+    "nv": 28,
+    "td": 30614.2,
+    "score": 58614.2,
+    "solve_time_seconds": 120
+  }
+}
+```
 
-@app.post("/benchmark")
-async def start_benchmark(
-    file: UploadFile,
-    rl_nv: int = Form(0),
-    rl_td: float = Form(0.0),
-    rl_score: float = Form(0.0),
-    rl_job_id: str = Form(""),
-):
-    benchmark_id = "bm_" + uuid4().hex[:8]
-    vrp_path = f"/tmp/{benchmark_id}.vrp"
+| Field | Type | Description |
+|---|---|---|
+| `job_id` | string | Same job_id from the original solve |
+| `instance_name` | string | Instance filename |
+| `num_nodes` | int | Total nodes including depot |
+| `rl.nv` | int | Vehicles used by the RL agent — **taken directly from the completed solve job** (no re-run needed) |
+| `rl.td` | float | Total distance from the RL solution |
+| `rl.score` | float | `1000 × rl.nv + rl.td` |
+| `hgs_default.nv` | int | Vehicles used by PyVRP with `AlgorithmParameters()` factory defaults |
+| `hgs_default.td` | float | Total distance from PyVRP default |
+| `hgs_default.score` | float | `1000 × hgs_default.nv + hgs_default.td` |
+| `hgs_large_pop.nv` | int | Vehicles used by PyVRP with `mu=50, lambda=80` |
+| `hgs_large_pop.td` | float | Total distance from large population run |
+| `hgs_large_pop.score` | float | `1000 × hgs_large_pop.nv + hgs_large_pop.td` |
 
-    with open(vrp_path, "wb") as f:
-        f.write(await file.read())
+**Response `425 Too Early`** — baselines still computing, Flutter polls again in 2s
+```json
+{ "status": "computing", "job_id": "a3f9c2b1" }
+```
 
-    benchmarks[benchmark_id] = {
-        "status": "running",
-        "message": "Starting benchmark...",
-        "comparisons": [],
-    }
-
-    threading.Thread(
-        target=run_benchmark_background,
-        args=(benchmark_id, vrp_path, rl_nv, rl_td, 0),
-        daemon=True,
-    ).start()
-
-    return JSONResponse(status_code=202, content={"benchmark_id": benchmark_id})
-
-
-@app.get("/benchmark/{benchmark_id}")
-def get_benchmark(benchmark_id: str):
-    bm = benchmarks.get(benchmark_id)
-    if bm is None:
-        return JSONResponse(status_code=404, content={"error": "Not found"})
-
-    response = {"benchmark_id": benchmark_id, **bm}
-
-    if bm["status"] == "complete":
-        response["instance_name"] = benchmark_id  # replace with real parsed name
-
-    return response
+**Response `404 Not Found`**
+```json
+{ "error": "Job not found", "job_id": "a3f9c2b1" }
 ```
 
 ---
 
-*ML4VRP 2026 — GECCO Competition · API Spec v2.1*
+### Implementation Notes for the Backend Dev
+
+**The RL result is free** — you already have it from the completed job:
+```python
+@app.get("/benchmark/{job_id}")
+async def benchmark(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404)
+
+    # RL result is already computed — just read it
+    rl_result = job["result"]  # from the completed /solve job
+
+    # Run PyVRP Default (same iteration budget: 20 × 1000 = 20,000)
+    hgs_default = run_pyvrp_baseline(
+        instance_path=job["instance_path"],
+        params=AlgorithmParameters(),         # factory defaults
+        total_iterations=20_000,
+    )
+
+    # Run PyVRP Large Population
+    hgs_large = run_pyvrp_baseline(
+        instance_path=job["instance_path"],
+        params=AlgorithmParameters(min_pop_size=50, generation_size=80),
+        total_iterations=20_000,
+    )
+
+    return {
+        "job_id": job_id,
+        "instance_name": job["instance_name"],
+        "num_nodes": job["num_nodes"],
+        "rl":           { "nv": rl_result["num_vehicles"], "td": rl_result["total_distance"], "score": rl_result["score"] },
+        "hgs_default":  { "nv": hgs_default.best.num_routes(), "td": hgs_default.best.distance(), "score": 1000*hgs_default.best.num_routes() + hgs_default.best.distance() },
+        "hgs_large_pop":{ "nv": hgs_large.best.num_routes(),   "td": hgs_large.best.distance(),   "score": 1000*hgs_large.best.num_routes()   + hgs_large.best.distance() },
+    }
+```
+
+**How to run the baselines with the same budget:**
+```python
+import pyvrp
+from pyvrp import AlgorithmParameters
+from pyvrp.stop import MaxIterations
+
+def run_pyvrp_baseline(instance_path: str, params: AlgorithmParameters, total_iterations: int):
+    data = pyvrp.read(instance_path, round_func="round")
+    result = pyvrp.solve(
+        data,
+        stop=MaxIterations(total_iterations),
+        params=params,
+        seed=42,       # fixed seed for reproducibility
+        display=False,
+    )
+    return result
+```
+
+**Same iteration budget matters for a fair comparison:**
+The RL agent runs 20 steps × 1,000 iterations = 20,000 ILS iterations total.
+Both PyVRP baselines should use the same 20,000 iteration budget so the comparison is fair.
+
+---
+
+## Updated Summary Table
+
+| # | Method | Endpoint | Used By | When |
+|---|---|---|---|---|
+| 1 | `GET` | `/health` | Sidebar dot, Topbar indicator | App startup + every 15s |
+| 2 | `POST` | `/solve` | Solver Console — Run button | User clicks Run |
+| 3 | `GET` | `/status/{job_id}` | Solver Console — live monitor | Every 500ms while running |
+| 4 | `GET` | `/result/{job_id}` | Solution Viewer | Once job completes |
+| 5 | `GET` | `/runs` | Dashboard table + chart | Dashboard load + every 30s |
+| 6 | `POST` | `/stop/{job_id}` | Solver Console — Stop button | User clicks Stop |
+| **7** | **`GET`** | **`/benchmark/{job_id}`** | **Benchmark page** | **After solve completes** |
+
+---
+
+*ML4VRP 2026 — GECCO Competition · API Spec v2.0*
