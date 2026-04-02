@@ -131,11 +131,11 @@ def main():
     parser = argparse.ArgumentParser(description="HGS-CVRP Baseline Evaluation")
     parser.add_argument("--instance_path", type=str, required=True,
                         help="Directory containing .vrp files")
-    parser.add_argument("--nb_iter", type=int, default=2000,
+    parser.add_argument("--nb_iter", type=int, default=5000,
                         help="HGS iterations per solve (should match RL iters_per_step)")
     parser.add_argument("--num_seeds", type=int, default=3,
                         help="Number of random seeds to average over")
-    parser.add_argument("--num_steps", type=int, default=10,
+    parser.add_argument("--num_steps", type=int, default=5,
                         help="Number of solves per instance (to match RL episode steps)")
     parser.add_argument("--all", action="store_true",
                         help="Run on ALL instances, not just the 5 eval ones")
@@ -152,13 +152,15 @@ def main():
 
     print(f"Eval instances: {[p.stem for p in eval_instances]}")
     print(f"Config: nb_iter={args.nb_iter}, num_seeds={args.num_seeds}, num_steps={args.num_steps}")
-    print(f"Total HGS iterations per instance per seed: {args.nb_iter * args.num_steps}")
     print()
 
-    header = (
+    # --- Table 1: Single-solve baseline (fair comparison for RL) ---
+    # This is what HGS gets with ONE solve using default params — the realistic
+    # "no RL" scenario. The RL agent must beat this to prove it adds value.
+    header1 = (
         f"{'Instance':<25s} "
-        f"{'--- DEFAULT ---':^30s}   "
-        f"{'--- LARGE POP ---':^30s}"
+        f"{'--- SINGLE DEFAULT ---':^30s}   "
+        f"{'--- SINGLE LARGE POP ---':^30s}"
     )
     sub_header = (
         f"{'':25s} "
@@ -168,24 +170,68 @@ def main():
     sep = "-" * 95
 
     print("=" * 95)
-    print(header)
+    print("SINGLE-SOLVE BASELINE (fair RL comparison: 1 solve, default params)")
+    print("=" * 95)
+    print(header1)
     print(sub_header)
     print(sep)
 
-    all_default_scores = []
-    all_large_scores = []
+    single_default_scores = []
+    single_large_scores = []
     baseline_start = time.time()
 
     for inst_idx, inst_path in enumerate(eval_instances):
         inst_t0 = time.time()
         data = parse_vrp_file(inst_path)
 
-        # Run multiple seeds, each with num_steps solves, keep the best
+        # Single solve with default params (seed=42) — this is what reset() does
+        res_default = run_default_baseline(data, args.nb_iter, seed=42)
+        res_large = run_large_pop_baseline(data, args.nb_iter, seed=42)
+
+        single_default_scores.append(res_default["score"])
+        single_large_scores.append(res_large["score"])
+
+        inst_elapsed = time.time() - inst_t0
+        im, isec = divmod(int(inst_elapsed), 60)
+        remaining = len(eval_instances) - (inst_idx + 1)
+        eta_sec = inst_elapsed * remaining
+        eta_m, eta_s = divmod(int(eta_sec), 60)
+
+        print(
+            f"{inst_path.stem:<25s} "
+            f"{res_default['nv']:>5d} {res_default['td']:>10.0f} {res_default['score']:>10.0f}   "
+            f"{res_large['nv']:>5d} {res_large['td']:>10.0f} {res_large['score']:>10.0f}"
+            f"   ({im}m{isec:02d}s, ETA: {eta_m}m{eta_s:02d}s)"
+        )
+
+    print(sep)
+    print(
+        f"{'AVERAGE':<25s} "
+        f"{'':>5s} {'':>10s} {np.mean(single_default_scores):>10.0f}   "
+        f"{'':>5s} {'':>10s} {np.mean(single_large_scores):>10.0f}"
+    )
+    print("=" * 95)
+    print()
+
+    # --- Table 2: Best-of-N baseline (upper bound) ---
+    # Multiple seeds × multiple steps, keeping the best. This shows what HGS
+    # can achieve with brute-force repetition — an upper bound, not a fair comparison.
+    print("=" * 95)
+    print(f"BEST-OF-N BASELINE (upper bound: {args.num_seeds} seeds x {args.num_steps} steps)")
+    print("=" * 95)
+    print(header1.replace("SINGLE DEFAULT", "BEST DEFAULT").replace("SINGLE LARGE POP", "BEST LARGE POP"))
+    print(sub_header)
+    print(sep)
+
+    all_default_scores = []
+    all_large_scores = []
+
+    for inst_idx, inst_path in enumerate(eval_instances):
+        inst_t0 = time.time()
+        data = parse_vrp_file(inst_path)
+
         best_default = {"score": float("inf")}
         best_large = {"score": float("inf")}
-
-        total_solves = args.num_seeds * args.num_steps
-        solve_count = 0
 
         for s in range(args.num_seeds):
             seed = 42 + s * 1000
@@ -195,14 +241,12 @@ def main():
                 res = run_default_baseline(data, args.nb_iter, step_seed)
                 if res["score"] < best_default["score"]:
                     best_default = res
-                solve_count += 1
 
             for step in range(args.num_steps):
                 step_seed = seed + step
                 res = run_large_pop_baseline(data, args.nb_iter, step_seed)
                 if res["score"] < best_large["score"]:
                     best_large = res
-                solve_count += 1
 
             print(
                 f"  {inst_path.stem} seed {s+1}/{args.num_seeds}: "
