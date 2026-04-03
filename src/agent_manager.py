@@ -1,30 +1,26 @@
 """
 Stage 2 - Fleet Manager: The RL agent that controls the solver.
 
-This is the "brain" of the system. While the GNN Encoder (Stage 1) understands
-the spatial structure of a CVRP instance, the Fleet Manager makes DECISIONS
-about how to run the solver.
+This is the "brain" of the system. It looks at hand-crafted instance features
+and real-time solver statistics, then decides which HGS parameter configuration
+to use for the next solve step.
 
 WHAT IT DOES:
-  At each of the 20 steps in an episode, the Fleet Manager looks at:
-    1. The instance embedding (128-dim vector from the GNN — "what does this problem look like?")
-    2. Four real-time statistics from the solver ("how is the search going?")
+  At each of the 50 steps in an episode, the Fleet Manager looks at:
+    1. Instance features (7-dim — size, demand, distance stats, etc.)
+    2. Seven real-time statistics from the solver ("how is the search going?")
   And chooses one of 7 HGS parameter configurations for the next solve.
 
-WHY THIS MATTERS:
-  The competition score is 1000*NV + TD. Removing one vehicle saves 1000 distance
-  units — so fleet reduction is the dominant factor. But pushing too hard for fewer
-  vehicles can backfire (solver panics, routes explode). The Fleet Manager learns
-  WHEN to push hard, WHEN to back off, and WHEN to try something completely different.
-
 OBSERVATION (what the agent sees):
-  132-dim vector = [graph_embedding (128) | solver_stats (4)]
+  14-dim vector = [instance_features (7) | solver_stats (7)]
 
-  The 4 solver stats are:
-    - time_ratio:       steps_used / 20         ("How much budget is left?")
-    - nv_ratio:         NV_current / NV_initial  ("How much fleet reduction so far?")
-    - violation_ratio:  excess_load / total_demand ("Am I pushing too hard?")
-    - stagnation_ratio: iters_no_improve / budget  ("Am I stuck?")
+  Instance features (computed once per episode):
+    - size_norm, demand_fill_ratio, mean_dist_norm, std_dist_norm,
+      depot_centrality, demand_cv, capacity_tightness
+
+  Solver stats (updated each step):
+    - time_ratio, nv_ratio, score_ratio, stagnation_ratio,
+      nv_gap, last_reward, last_action_norm
 
 ACTION SPACE (what the agent can do):
   0 = DEFAULT            — Standard HGS parameters (the baseline)
@@ -37,12 +33,12 @@ ACTION SPACE (what the agent can do):
 
 ARCHITECTURE: Actor-Critic
   The network has two "heads" sharing a common trunk:
-    - Actor: outputs a probability distribution over the 6 actions (policy)
+    - Actor: outputs a probability distribution over the 7 actions (policy)
     - Critic: outputs a single number estimating "how good is this state?" (value)
   PPO uses both during training — the actor learns better actions, the critic
   learns to evaluate states for computing advantages (see train.py).
 
-Parameters: ~13,100 (intentionally tiny — it's making strategic decisions, not
+Parameters: ~5,700 (intentionally tiny — it's making strategic decisions, not
 computing routes)
 """
 
@@ -51,8 +47,9 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 
-# The 4 real-time solver statistics that supplement the graph embedding
-SOLVER_STATS_DIM = 4  # [time_ratio, nv_ratio, violation_ratio, stagnation_ratio]
+# Observation dimensions — must match solver_engine.py
+INSTANCE_FEATURES_DIM = 7  # Hand-crafted instance features
+SOLVER_STATS_DIM = 7       # [time_ratio, nv_ratio, score_ratio, stagnation, nv_gap, last_reward, last_action]
 
 # Total number of discrete strategy choices available to the agent
 NUM_FLEET_ACTIONS = 7
@@ -68,7 +65,7 @@ class FleetManager(nn.Module):
     """Actor-Critic neural network for solver strategy selection.
 
     This is the trainable RL agent. It takes the current state (instance
-    embedding + solver stats) and outputs:
+    features + solver stats) and outputs:
       1. Action probabilities — which strategy to use next
       2. State value — how good is the current situation (for PPO training)
 
@@ -77,38 +74,38 @@ class FleetManager(nn.Module):
     lifting; this network just learns to steer it.
 
     Args:
-        embed_dim: Dimension of graph embedding from GNNEncoder (128).
-        stats_dim: Dimension of solver statistics vector (4).
+        embed_dim: Dimension of instance features (7).
+        stats_dim: Dimension of solver statistics vector (7).
         hidden_dim: Width of hidden layers (64).
-        num_actions: Number of discrete strategy choices (6).
+        num_actions: Number of discrete strategy choices (7).
     """
 
     def __init__(
         self,
-        embed_dim: int = 128,
+        embed_dim: int = INSTANCE_FEATURES_DIM,
         stats_dim: int = SOLVER_STATS_DIM,
         hidden_dim: int = 64,
         num_actions: int = NUM_FLEET_ACTIONS,
     ):
         super().__init__()
-        input_dim = embed_dim + stats_dim  # 128 + 4 = 132
+        input_dim = embed_dim + stats_dim  # 7 + 7 = 14
 
         # --- Shared Feature Trunk ---
         # Both the actor and critic share these layers. This is efficient and
         # helps the critic's value estimates stay aligned with the actor's policy.
         # Two layers of 64 units with ReLU activation.
         self.shared = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),  # 132 → 64
+            nn.Linear(input_dim, hidden_dim),  # 14 → 64
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), # 64 → 64
             nn.ReLU(),
         )
 
         # --- Actor Head (Policy) ---
-        # Outputs raw logits (unnormalized scores) for each of the 6 actions.
+        # Outputs raw logits (unnormalized scores) for each of the 7 actions.
         # These logits are converted to probabilities via softmax in Categorical().
         # Higher logit = higher probability of choosing that action.
-        self.actor = nn.Linear(hidden_dim, num_actions)  # 64 → 6
+        self.actor = nn.Linear(hidden_dim, num_actions)  # 64 → 7
 
         # --- Critic Head (Value Function) ---
         # Outputs a single scalar V(s) — the estimated cumulative future reward
@@ -137,16 +134,16 @@ class FleetManager(nn.Module):
           steps on impossible fleet reductions.
 
         Args:
-            graph_embedding: (B, 128) instance summary from GNNEncoder.
-            solver_stats:    (B, 4) real-time solver feedback.
-            action_mask:     (B, 6) bool tensor. True = action allowed, False = blocked.
+            graph_embedding: (B, 7) hand-crafted instance features.
+            solver_stats:    (B, 7) real-time solver feedback.
+            action_mask:     (B, 7) bool tensor. True = action allowed, False = blocked.
 
         Returns:
-            action_logits: (B, 6) raw scores for each action (masked ones set to -1e4).
+            action_logits: (B, 7) raw scores for each action (masked ones set to -1e4).
             state_value:   (B, 1) estimated future reward from this state.
         """
-        # Concatenate instance understanding + solver feedback into one observation
-        obs = torch.cat([graph_embedding, solver_stats], dim=-1)  # (B, 132)
+        # Concatenate instance features + solver feedback into one observation
+        obs = torch.cat([graph_embedding, solver_stats], dim=-1)  # (B, 14)
 
         # Shared feature extraction
         features = self.shared(obs)           # (B, 64)
@@ -179,12 +176,12 @@ class FleetManager(nn.Module):
         During evaluation, we use forward() + argmax instead (greedy, no randomness).
 
         Args:
-            graph_embedding: (B, 128) from GNNEncoder.
-            solver_stats:    (B, 4) solver statistics.
-            action_mask:     (B, 6) bool tensor. True = allowed, False = masked.
+            graph_embedding: (B, 7) hand-crafted instance features.
+            solver_stats:    (B, 7) solver statistics.
+            action_mask:     (B, 7) bool tensor. True = allowed, False = masked.
 
         Returns:
-            action:      (B,) sampled action index (0-5).
+            action:      (B,) sampled action index (0-6).
             log_prob:    (B,) log-probability of the sampled action (for PPO).
             state_value: (B, 1) critic's value estimate (for advantage computation).
         """

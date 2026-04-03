@@ -17,9 +17,8 @@ from fastapi.responses import JSONResponse
 
 import torch
 import hygese as hgs
-from src.model_vision import GNNEncoder
-from src.agent_manager import FleetManager
-from src.solver_engine import CVRPEnv, _parse_vrp_file 
+from src.agent_manager import FleetManager, INSTANCE_FEATURES_DIM
+from src.solver_engine import CVRPEnv, _parse_vrp_file
 
 # =============================================================================
 # APP SETUP & STATE MANAGEMENT
@@ -27,21 +26,22 @@ from src.solver_engine import CVRPEnv, _parse_vrp_file
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-jobs: dict[str, dict] = {}
-runs_db: list[dict] = []
+# In-memory databases for our current session.
+# (If the server restarts, these will clear out!)
+jobs: dict[str, dict] = {}           # Tracks active /solve jobs
+runs_db: list[dict] = []             # History of completed runs for the dashboard
+benchmarks: dict[str, dict] = {}     # Tracks active /benchmark jobs
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-gnn_model = GNNEncoder().to(device)     
-fleet_manager = FleetManager().to(device)       
+# 1. Initialize the Fleet Manager (the RL agent)
+fleet_manager = FleetManager().to(device)
 
-# DEAR MAKHAVI, ACTION REQUIRED HERE POST-TRAINING 
-# Once the models finish training, try UNCOMMENTING the 4 lines below or do it your own way.
+# DEAR MAKHAVI, ACTION REQUIRED HERE POST-TRAINING
+# Once the models finish training, try UNCOMMENTING the 2 lines below or do it your own way.
 # Note: We use `map_location=device` so the app doesn't crash if it tries to load a GPU-trained model on a machine that only has a CPU.
 # -----------------------------------------------------------------------------
-# gnn_model.load_state_dict(torch.load("checkpoints/gnn_latest.pth", map_location=device)) 
-# fleet_manager.load_state_dict(torch.load("checkpoints/fm_latest.pth", map_location=device)) 
-# gnn_model.eval()       # Locks the GNN in evaluation mode (important!)
+# fleet_manager.load_state_dict(torch.load("checkpoints/fm_latest.pth", map_location=device))
 # fleet_manager.eval()   # Locks the RL agent in evaluation mode (important!)
 # -----------------------------------------------------------------------------
 
@@ -120,14 +120,14 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
     try:
         start_time = time.time()
         
-        # Stage 1: GNN Encoding
+        # --- STAGES 1 & 2: Feature Extraction & Environment Init ---
         jobs[job_id]["current_stage"] = 1
         jobs[job_id]["stage_statuses"]["1"] = "running"
         jobs[job_id]["log_lines"].append(f"[SYS] Mode: {jobs[job_id]['mode'].upper()} | Limit: {jobs[job_id]['time_limit_seconds']}s")
-        jobs[job_id]["log_lines"].append("[GNN] Encoding spatial graph...")
+        jobs[job_id]["log_lines"].append("[FE] Computing instance features...")
 
-        # Initialize CVRPEnv - Explicitly setting 1000 iters_per_step to match the 20,000 budget spec
-        env = CVRPEnv(instance_paths=[vrp_path], encoder=gnn_model, device=device, iters_per_step=1000)
+        # env.reset() computes hand-crafted instance features and initial solve
+        env = CVRPEnv(instance_paths=[vrp_path], device=device)
         obs, info = env.reset()
         
         jobs[job_id]["stage_statuses"]["1"] = "done"
@@ -145,30 +145,35 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
         jobs[job_id]["stage_statuses"]["3"] = "running"
         
         stage_3_start = time.time()
-        for step in range(20):
+        max_steps = env.MAX_STEPS  # 50 steps with new design
+        for step in range(max_steps):
             if jobs[job_id]["status"] == "stopped": return
-            
+
             obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            graph_emb, stats = obs_tensor[:, :128], obs_tensor[:, 128:]
-            
+            inst_feat = obs_tensor[:, :INSTANCE_FEATURES_DIM]
+            stats = obs_tensor[:, INSTANCE_FEATURES_DIM:]
+
             mask = info.get("action_mask")
             mask_tensor = torch.tensor(mask, dtype=torch.bool, device=device).unsqueeze(0) if mask is not None else None
-            
+
             with torch.no_grad():
-                action_logits, _ = fleet_manager(graph_emb, stats, action_mask=mask_tensor)
-                
+                action_logits, _ = fleet_manager(inst_feat, stats, action_mask=mask_tensor)
+
             action = torch.argmax(action_logits).item()
             obs, reward, done, trunc, info = env.step(action)
-            
-            jobs[job_id]["iteration"] = (step + 1) * 1000 
+
+            jobs[job_id]["iteration"] = (step + 1) * env.ITERS_PER_STEP
             jobs[job_id]["current_nv"] = info.get("nv", 0)
             jobs[job_id]["best_nv"] = info.get("nv", 0)
             jobs[job_id]["current_td"] = round(info.get("td", 0.0), 2)
             jobs[job_id]["best_td"] = round(info.get("td", 0.0), 2)
             jobs[job_id]["current_score"] = round(info.get("score", 0.0), 2)
             jobs[job_id]["best_score"] = round(info.get("score", 0.0), 2)
-            jobs[job_id]["log_lines"].append(f"[FM] Step {step+1}/20: Strategy {action}")
+            jobs[job_id]["log_lines"].append(f"[FM] Step {step+1}/{max_steps}: Strategy {action}")
             jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]
+
+            if done or trunc:
+                break
 
         jobs[job_id]["stage_statuses"]["3"] = "done"
         jobs[job_id]["stage_times_seconds"]["3"] = round(time.time() - stage_3_start, 2)

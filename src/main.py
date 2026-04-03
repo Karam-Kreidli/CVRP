@@ -114,22 +114,22 @@ def smoke_test_batched():
 
 def smoke_test_fleet_manager():
     """Verify FleetManager forward pass with 7 actions."""
-    from src.agent_manager import FleetManager, NUM_FLEET_ACTIONS
+    from src.agent_manager import FleetManager, NUM_FLEET_ACTIONS, INSTANCE_FEATURES_DIM, SOLVER_STATS_DIM
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     manager = FleetManager().to(device)
 
     B = 4
-    graph_emb = torch.rand(B, 128, device=device)
-    solver_stats = torch.rand(B, 4, device=device)
+    inst_feat = torch.rand(B, INSTANCE_FEATURES_DIM, device=device)
+    solver_stats = torch.rand(B, SOLVER_STATS_DIM, device=device)
 
-    action_logits, state_value = manager(graph_emb, solver_stats)
+    action_logits, state_value = manager(inst_feat, solver_stats)
 
     assert action_logits.shape == (B, NUM_FLEET_ACTIONS), f"Expected ({B}, {NUM_FLEET_ACTIONS}), got {action_logits.shape}"
     assert state_value.shape == (B, 1), f"Expected ({B}, 1), got {state_value.shape}"
 
     # Verify select_action sampling
-    action, log_prob, sv = manager.select_action(graph_emb, solver_stats)
+    action, log_prob, sv = manager.select_action(inst_feat, solver_stats)
     assert action.shape == (B,), f"Expected ({B},), got {action.shape}"
     assert log_prob.shape == (B,), f"Expected ({B},), got {log_prob.shape}"
     assert all(0 <= a < NUM_FLEET_ACTIONS for a in action.tolist())
@@ -143,7 +143,7 @@ def smoke_test_fleet_manager():
 
 def smoke_test_fleet_manager_fp16():
     """Verify FleetManager under AMP on GPU."""
-    from src.agent_manager import FleetManager, NUM_FLEET_ACTIONS
+    from src.agent_manager import FleetManager, NUM_FLEET_ACTIONS, INSTANCE_FEATURES_DIM, SOLVER_STATS_DIM
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
@@ -152,11 +152,11 @@ def smoke_test_fleet_manager_fp16():
 
     manager = FleetManager().to(device)
     B = 8
-    graph_emb = torch.rand(B, 128, device=device)
-    solver_stats = torch.rand(B, 4, device=device)
+    inst_feat = torch.rand(B, INSTANCE_FEATURES_DIM, device=device)
+    solver_stats = torch.rand(B, SOLVER_STATS_DIM, device=device)
 
     with torch.amp.autocast("cuda"):
-        action_logits, state_value = manager(graph_emb, solver_stats)
+        action_logits, state_value = manager(inst_feat, solver_stats)
 
     assert action_logits.shape == (B, NUM_FLEET_ACTIONS)
     assert state_value.shape == (B, 1)
@@ -166,27 +166,18 @@ def smoke_test_fleet_manager_fp16():
 
 
 def smoke_test_pipeline():
-    """End-to-end: GNNEncoder -> FleetManager on a synthetic instance."""
-    from src.model_vision import GNNEncoder
-    from src.agent_manager import FleetManager, ACTION_NAMES
+    """End-to-end: Instance features -> FleetManager on a synthetic observation."""
+    from src.agent_manager import FleetManager, ACTION_NAMES, INSTANCE_FEATURES_DIM, SOLVER_STATS_DIM
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder = GNNEncoder().to(device)
     manager = FleetManager().to(device)
 
-    N = 401
-    coords = torch.rand(N, 2)
-    demands = torch.rand(N, 1)
-    demands[0] = 0.0
-    x = torch.cat([coords, demands], dim=-1).to(device)
-    pos = coords.to(device)
-    batch = torch.zeros(N, dtype=torch.long, device=device)
+    # Simulate hand-crafted instance features + solver stats
+    inst_feat = torch.rand(1, INSTANCE_FEATURES_DIM, device=device)
+    solver_stats = torch.tensor([[0.5, 0.8, 0.95, 0.1, 0.2, 0.0, 0.0]], device=device)
+    action, log_prob, value = manager.select_action(inst_feat, solver_stats)
 
-    node_emb, graph_emb = encoder(x, pos, batch)
-    solver_stats = torch.tensor([[0.5, 0.8, 0.02, 0.1]], device=device)
-    action, log_prob, value = manager.select_action(graph_emb, solver_stats)
-
-    print(f"  GNN -> graph_emb: {graph_emb.shape}")
+    print(f"  Instance features: {inst_feat.shape}")
     print(f"  Fleet Manager -> action: {ACTION_NAMES[action.item()]}, value: {value.item():.4f}")
     print("  PASSED")
 
@@ -195,12 +186,9 @@ def smoke_test_cvrp_env():
     """Stage 3: Run CVRPEnv for one full step on a synthetic .vrp instance."""
     import tempfile
     import os
-    from src.model_vision import GNNEncoder
-    from src.solver_engine import CVRPEnv, ACTION_NAMES
+    from src.solver_engine import CVRPEnv, ACTION_NAMES, OBS_DIM
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder = GNNEncoder().to(device)
-    encoder.eval()
 
     vrp_content = """\
 NAME : smoke-test-n10
@@ -245,14 +233,13 @@ EOF
 
     env = CVRPEnv(
         instance_paths=[vrp_path],
-        encoder=encoder,
         device=device,
         iters_per_step=500,
         max_steps=5,
     )
 
     obs, info = env.reset(seed=42)
-    assert obs.shape == (132,), f"Expected (132,), got {obs.shape}"
+    assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
     print(f"  Reset -> NV={info['nv']}, TD={info['td']:.0f}, score={info['score']:.0f}")
 
     # Step through actions 0, 2, 6 (DEFAULT, LARGE_DIVERSE, EXPLORE_NEW_SEED)
@@ -260,7 +247,7 @@ EOF
     for action in [0, 2, 6]:
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
-        assert obs.shape == (132,)
+        assert obs.shape == (OBS_DIM,)
         print(f"  Step {info['step']}: {ACTION_NAMES[action]:>22s} -> "
               f"NV={info['nv']}, TD={info['td']:.0f}, "
               f"reward={reward:+.1f}, score={info['score']:.0f}")
@@ -277,13 +264,10 @@ def smoke_test_training():
     import tempfile
     import os
     import random as pyrandom
-    from src.model_vision import GNNEncoder
     from src.solver_engine import CVRPEnv
     from src.train import MARLTrainer, PPOConfig
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder = GNNEncoder().to(device)
-    encoder.eval()
 
     pyrandom.seed(42)
     lines = [
@@ -310,7 +294,6 @@ def smoke_test_training():
 
     env = CVRPEnv(
         instance_paths=[vrp_path],
-        encoder=encoder,
         device=device,
         iters_per_step=100,
         max_steps=3,
@@ -331,8 +314,7 @@ def smoke_test_training():
             f"  PPO Iteration {i + 1}: "
             f"score={stats['avg_score']:.0f}, "
             f"NV={stats['avg_nv']:.0f}, "
-            f"loss={stats['policy_loss']:.4f}, "
-            f"norm={stats.get('norm_mag', 0):.3f}"
+            f"loss={stats['policy_loss']:.4f}"
         )
 
     # Verify checkpoint save/load round-trip
@@ -352,13 +334,10 @@ def smoke_test_action_masking():
     """Verify NV_min calculation and action masking with 7-action space."""
     import tempfile
     import os
-    from src.model_vision import GNNEncoder
-    from src.solver_engine import CVRPEnv, NUM_ACTIONS
+    from src.solver_engine import CVRPEnv, NUM_ACTIONS, INSTANCE_FEATURES_DIM
     from src.agent_manager import FleetManager
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder = GNNEncoder().to(device)
-    encoder.eval()
 
     # 1 depot + 10 customers, each demand=10, capacity=50 -> NV_min = ceil(100/50) = 2
     vrp_content = """\
@@ -404,7 +383,6 @@ EOF
 
     env = CVRPEnv(
         instance_paths=[vrp_path],
-        encoder=encoder,
         device=device,
         iters_per_step=500,
         max_steps=5,
@@ -423,15 +401,15 @@ EOF
     manager = FleetManager().to(device)
     manager.eval()
 
-    graph_emb = torch.tensor(obs[:128], dtype=torch.float32, device=device).unsqueeze(0)
-    stats = torch.tensor(obs[128:], dtype=torch.float32, device=device).unsqueeze(0)
+    inst_feat = torch.tensor(obs[:INSTANCE_FEATURES_DIM], dtype=torch.float32, device=device).unsqueeze(0)
+    stats = torch.tensor(obs[INSTANCE_FEATURES_DIM:], dtype=torch.float32, device=device).unsqueeze(0)
 
     # Force mask: block aggressive actions (1=FAST_AGGRESSIVE, 4=HIGH_TURNOVER)
     forced_mask = torch.tensor(
         [[True, False, True, True, False, True, True]], dtype=torch.bool, device=device
     )
     with torch.no_grad():
-        logits, _ = manager(graph_emb, stats, action_mask=forced_mask)
+        logits, _ = manager(inst_feat, stats, action_mask=forced_mask)
 
     for blocked in [1, 4]:
         assert logits[0, blocked].item() < -1e3, \
@@ -441,7 +419,7 @@ EOF
     actions = []
     for _ in range(100):
         with torch.no_grad():
-            a, _, _ = manager.select_action(graph_emb, stats, action_mask=forced_mask)
+            a, _, _ = manager.select_action(inst_feat, stats, action_mask=forced_mask)
         actions.append(a.item())
     blocked_set = {1, 4}
     sampled_blocked = blocked_set & set(actions)
@@ -471,13 +449,11 @@ def train(args):
 
     This sets up all components and runs the main training loop:
       1. Load .vrp instance files from the dataset directory
-      2. Initialize the GNN Encoder (frozen — not trained by PPO)
-      3. Create the CVRPEnv (Gymnasium environment wrapping PyVRP)
-      4. Select 5 fixed evaluation instances for progress tracking
-      5. Create the MARLTrainer (PPO training engine)
-      6. Run the epoch loop with curriculum learning and checkpointing
+      2. Create the CVRPEnv (Gymnasium environment wrapping HGS-CVRP)
+      3. Select 5 fixed evaluation instances for progress tracking
+      4. Create the MARLTrainer (PPO training engine)
+      5. Run the epoch loop with curriculum learning and checkpointing
     """
-    from src.model_vision import GNNEncoder
     from src.solver_engine import CVRPEnv
     from src.train import MARLTrainer, PPOConfig
 
@@ -494,20 +470,13 @@ def train(args):
     assert len(instance_paths) > 0, f"No .vrp files found at {args.instance_path}"
     print(f"Instances: {len(instance_paths)}")
 
-    # --- Initialize GNN Encoder ---
-    # The encoder is NOT trained by PPO — it's used in eval mode to produce
-    # graph embeddings at the start of each episode. Its weights are randomly
-    # initialized and stay fixed throughout training.
-    encoder = GNNEncoder().to(device)
-    encoder.eval()
-
     # --- Create Environment ---
-    # CVRPEnv wraps PyVRP and implements the Gymnasium interface.
+    # CVRPEnv wraps HGS-CVRP and implements the Gymnasium interface.
+    # Hand-crafted instance features replace the untrained GNN encoder.
     # Curriculum learning: start with small instances (N<=100) for the first
     # curriculum_epochs, then unlock all instances (up to 400 nodes).
     env = CVRPEnv(
         instance_paths=[str(p) for p in instance_paths],
-        encoder=encoder,
         device=device,
         max_nodes=100 if args.curriculum_epochs > 0 else None,
     )
@@ -545,8 +514,8 @@ def train(args):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Resume from Checkpoint (if provided) ---
-    # Restores model weights, optimizer state, LR schedule, reward normalization,
-    # and best score. Used after GPU quota exhaustion or accidental interruption.
+    # Restores model weights, optimizer state, LR schedule, and best score.
+    # Used after GPU quota exhaustion or accidental interruption.
     start_epoch = args.start_epoch
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
@@ -648,19 +617,19 @@ def parse_args():
 
     tp = sub.add_parser("train", help="Run PPO training")
     tp.add_argument("--epochs", type=int, default=50)
-    tp.add_argument("--batch_size", type=int, default=64)
+    tp.add_argument("--batch_size", type=int, default=128)
     tp.add_argument("--instance_path", type=str, required=True,
                      help="Path to .vrp file or directory of .vrp files")
     tp.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     tp.add_argument("--save_interval", type=int, default=10)
-    tp.add_argument("--episodes_per_epoch", type=int, default=4,
+    tp.add_argument("--episodes_per_epoch", type=int, default=8,
                      help="Episodes per epoch (more = stabler gradients)")
     tp.add_argument("--eval_instances", type=str, default=None,
                      help="Directory of .vrp files for fixed evaluation")
     tp.add_argument("--manager_lr", type=float, default=1e-4)
     tp.add_argument("--fp16", action="store_true",
                      help="Enable FP16 mixed precision (requires CUDA)")
-    tp.add_argument("--ent_coeff", type=float, default=0.05,
+    tp.add_argument("--ent_coeff", type=float, default=0.02,
                      help="Entropy bonus coefficient")
     tp.add_argument("--log_dir", type=str, default="logs",
                      help="Directory for CSV training metrics")
@@ -692,7 +661,7 @@ if __name__ == "__main__":
         smoke_test_fleet_manager()
         print("\n=== Stage 2: Fleet Manager FP16 ===")
         smoke_test_fleet_manager_fp16()
-        print("\n=== Stage 1+2: End-to-End Pipeline ===")
+        print("\n=== Stage 1+2: Instance Features -> Fleet Manager Pipeline ===")
         smoke_test_pipeline()
         print("\n=== Stage 3: CVRPEnv (HGS-CVRP wrapper, 7 actions) ===")
         smoke_test_cvrp_env()

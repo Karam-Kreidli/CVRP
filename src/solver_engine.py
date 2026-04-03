@@ -7,7 +7,7 @@ parameters (population sizes, search granularity, feasibility targets, etc.).
 
 HOW IT WORKS:
   The environment follows the standard Gymnasium (OpenAI Gym) interface:
-    1. reset()  — Load a random CVRP instance, encode it with the GNN, do an initial solve
+    1. reset()  — Load a random CVRP instance, compute hand-crafted features, do initial solve
     2. step(action) — Apply the chosen parameter configuration for a fresh HGS solve
     3. Repeat step() MAX_STEPS times → episode ends
 
@@ -24,8 +24,9 @@ WHAT THE ACTIONS ACTUALLY DO:
   6 = EXPLORE_NEW_SEED   — Default params with a fresh random seed (escape local optima)
 
 REWARD:
-  reward = previous_score - new_score  (positive when the score IMPROVES)
-  Since score = 1000*NV + TD, removing a vehicle gives reward ≈ +1000.
+  Percentage-based improvement over the previous step's candidate score.
+  Positive when score improves, small negative (-0.5) when no improvement,
+  larger penalty (-5.0) for fleet explosions.
 
 Competition score: 1000 * NV + TD  (lower is better)
 """
@@ -43,18 +44,16 @@ import torch
 
 import hygese as hgs
 
-from src.model_vision import GNNEncoder
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-EMBED_DIM = 128          # Graph embedding dimension (from GNN Encoder)
-STATS_DIM = 4            # Solver statistics: [time_ratio, nv_ratio, score_ratio, stagnation]
-OBS_DIM = EMBED_DIM + STATS_DIM  # 132 = total observation dimension for the agent
-NUM_ACTIONS = 7          # Number of discrete strategy choices
-ITERS_PER_STEP = 5_000   # HGS iterations (nbIter) per environment step
-MAX_STEPS = 5            # Steps per episode
-TIME_PER_STEP = 0.0      # HGS time limit per step (0 = use nbIter only)
+INSTANCE_FEATURES_DIM = 7    # Hand-crafted instance features (replaces GNN)
+STATS_DIM = 7                # Solver stats: time, nv_ratio, score_ratio, stagnation, nv_gap, last_reward, last_action
+OBS_DIM = INSTANCE_FEATURES_DIM + STATS_DIM  # 14 = total observation dimension
+NUM_ACTIONS = 7              # Number of discrete strategy choices
+ITERS_PER_STEP = 500         # HGS iterations (nbIter) per environment step
+MAX_STEPS = 50               # Steps per episode (total budget: 500 * 50 = 25,000)
+TIME_PER_STEP = 0.0          # HGS time limit per step (0 = use nbIter only)
 
 ACTION_NAMES = [
     "DEFAULT", "FAST_AGGRESSIVE", "LARGE_DIVERSE",
@@ -159,6 +158,93 @@ def _parse_vrp_file(path: pathlib.Path) -> dict:
     return data
 
 
+def _compute_instance_features(data: dict) -> np.ndarray:
+    """Compute hand-crafted instance features (replaces untrained GNN).
+
+    Returns a 1-D numpy array of INSTANCE_FEATURES_DIM floats, all roughly
+    in [0, 1] range for stable learning.
+
+    Features:
+      0. size_norm:          num_customers / 400
+      1. demand_fill_ratio:  total_demand / (nv_min * capacity)
+      2. mean_dist_norm:     mean inter-customer distance / max distance
+      3. std_dist_norm:      std of inter-customer distances / max distance
+      4. depot_centrality:   mean depot-to-customer distance / max distance
+      5. demand_cv:          coefficient of variation of demands (std/mean)
+      6. capacity_tightness: max single demand / capacity
+    """
+    x = data["x_coordinates"]
+    y = data["y_coordinates"]
+    demands = data["demands"]
+    capacity = float(data["vehicle_capacity"])
+    n = len(x)  # includes depot
+    num_customers = n - 1
+
+    # 0. Normalized instance size
+    size_norm = num_customers / 400.0
+
+    # 1. Demand fill ratio — how tightly packed the vehicles are
+    total_demand = demands[1:].sum()  # exclude depot
+    nv_min = max(1, math.ceil(total_demand / capacity))
+    demand_fill_ratio = total_demand / (nv_min * capacity) if capacity > 0 else 1.0
+
+    # Customer coordinates (exclude depot at index 0)
+    cx = x[1:]
+    cy = y[1:]
+
+    # Pairwise distances (subsample if too large for memory)
+    if num_customers <= 200:
+        dx = cx[:, None] - cx[None, :]
+        dy = cy[:, None] - cy[None, :]
+        dists = np.sqrt(dx**2 + dy**2)
+        # Exclude diagonal (self-distances)
+        mask = ~np.eye(num_customers, dtype=bool)
+        pairwise = dists[mask]
+    else:
+        # Subsample 200 customers for speed
+        idx = np.random.choice(num_customers, 200, replace=False)
+        sx, sy = cx[idx], cy[idx]
+        dx = sx[:, None] - sx[None, :]
+        dy = sy[:, None] - sy[None, :]
+        dists = np.sqrt(dx**2 + dy**2)
+        mask = ~np.eye(200, dtype=bool)
+        pairwise = dists[mask]
+
+    max_dist = pairwise.max() if len(pairwise) > 0 else 1.0
+    max_dist = max(max_dist, 1e-8)
+
+    # 2. Mean distance normalized
+    mean_dist_norm = pairwise.mean() / max_dist if len(pairwise) > 0 else 0.5
+
+    # 3. Std distance normalized
+    std_dist_norm = pairwise.std() / max_dist if len(pairwise) > 0 else 0.0
+
+    # 4. Depot centrality — how central the depot is
+    depot_dists = np.sqrt((cx - x[0])**2 + (cy - y[0])**2)
+    depot_centrality = depot_dists.mean() / max_dist if max_dist > 0 else 0.5
+
+    # 5. Demand coefficient of variation
+    cust_demands = demands[1:]
+    d_mean = cust_demands.mean() if num_customers > 0 else 1.0
+    d_std = cust_demands.std() if num_customers > 0 else 0.0
+    demand_cv = d_std / max(d_mean, 1e-8)
+    demand_cv = min(demand_cv, 2.0) / 2.0  # Clip and normalize to [0, 1]
+
+    # 6. Capacity tightness — largest single demand relative to vehicle capacity
+    max_demand = cust_demands.max() if num_customers > 0 else 0.0
+    capacity_tightness = max_demand / capacity if capacity > 0 else 1.0
+
+    return np.array([
+        size_norm,
+        demand_fill_ratio,
+        mean_dist_norm,
+        std_dist_norm,
+        depot_centrality,
+        demand_cv,
+        capacity_tightness,
+    ], dtype=np.float32)
+
+
 class CVRPEnv(gym.Env):
     """Gymnasium environment that wraps HGS-CVRP for RL-guided solving.
 
@@ -167,7 +253,7 @@ class CVRPEnv(gym.Env):
     DQN, etc.) can interact with it via reset() and step().
 
     EPISODE LIFECYCLE:
-      1. reset() picks a random .vrp instance, encodes it with the GNN,
+      1. reset() picks a random .vrp instance, computes hand-crafted features,
          runs an initial solve with default HGS parameters.
       2. step(action) maps the chosen action to HGS AlgorithmParameters,
          runs a fresh solve, and keeps the best solution found across all steps.
@@ -182,8 +268,7 @@ class CVRPEnv(gym.Env):
 
     Args:
         instance_paths: List of paths to .vrp files (X-dataset format).
-        encoder: GNNEncoder for computing graph embeddings (used at reset).
-        device: Torch device for encoder inference.
+        device: Torch device (kept for compatibility, minimal GPU use now).
         iters_per_step: HGS iterations per step (nbIter parameter).
         max_steps: Steps per episode.
         max_nodes: Curriculum filter — only use instances with <= N customers.
@@ -194,7 +279,6 @@ class CVRPEnv(gym.Env):
     def __init__(
         self,
         instance_paths: list[str | pathlib.Path],
-        encoder: GNNEncoder,
         device: torch.device = torch.device("cpu"),
         iters_per_step: int = ITERS_PER_STEP,
         max_steps: int = MAX_STEPS,
@@ -205,7 +289,6 @@ class CVRPEnv(gym.Env):
         self._all_instance_paths = [pathlib.Path(p) for p in instance_paths]
         self.max_nodes = max_nodes
         self.instance_paths = self._filter_by_nodes(self._all_instance_paths)
-        self.encoder = encoder
         self.device = device
         self.iters_per_step = iters_per_step
         self.max_steps = max_steps
@@ -222,15 +305,16 @@ class CVRPEnv(gym.Env):
         self._best_nv: int = 0                       # Best NV found this episode
         self._best_td: float = 0.0                   # Best TD found this episode
         self._best_score: float = float("inf")       # Best score found this episode
-        self._graph_embedding: torch.Tensor | None = None
-        self._node_embeddings: torch.Tensor | None = None
+        self._instance_features: np.ndarray | None = None  # Hand-crafted features
         self._nv_initial: int = 0                    # Fleet size after initial solve
         self._nv_min: int = 1                        # Theoretical minimum fleet
-        self._prev_score: float = 0.0                # Score from previous step
+        self._prev_cand_score: float = 0.0           # Previous step's candidate score
         self._step_count: int = 0
         self._iters_since_improvement: int = 0       # Stagnation counter
         self._seed: int = 0
         self._capacity: int = 1                      # Vehicle capacity (for nv_min)
+        self._last_reward: float = 0.0               # Reward from previous step
+        self._last_action: int = 0                   # Action from previous step
 
     def _compute_nv_min(self) -> int:
         """Compute theoretical minimum fleet size: ceil(total_demand / capacity)."""
@@ -301,10 +385,10 @@ class CVRPEnv(gym.Env):
     def reset(
         self, *, seed: int | None = None, options: dict | None = None
     ) -> tuple[np.ndarray, dict[str, Any]]:
-        """Start a new episode: load instance, encode it, do initial solve.
+        """Start a new episode: load instance, compute features, do initial solve.
 
         Returns:
-            obs: (132,) numpy array — the agent's first observation
+            obs: (OBS_DIM,) numpy array — the agent's first observation
             info: dict with instance name, initial NV/TD/score, action mask
         """
         super().reset(seed=seed)
@@ -316,8 +400,8 @@ class CVRPEnv(gym.Env):
         self._seed = seed if seed is not None else random.randint(0, 2**31)
         self._nv_min = self._compute_nv_min()
 
-        # Encode instance with GNN (done ONCE per episode)
-        self._graph_embedding, self._node_embeddings = self._encode_instance()
+        # Compute hand-crafted instance features (replaces GNN)
+        self._instance_features = _compute_instance_features(self._hgs_data)
 
         # Initial solve with default HGS parameters
         default_params = hgs.AlgorithmParameters(
@@ -331,9 +415,11 @@ class CVRPEnv(gym.Env):
         self._best_td = result["td"]
         self._best_score = result["score"]
         self._nv_initial = result["nv"]
-        self._prev_score = result["score"]
+        self._prev_cand_score = result["score"]
         self._step_count = 0
         self._iters_since_improvement = 0
+        self._last_reward = 0.0
+        self._last_action = 0
 
         obs = self._build_observation()
         info = {
@@ -352,8 +438,13 @@ class CVRPEnv(gym.Env):
         """Execute one HGS solve with the chosen parameter configuration.
 
         Each step runs a FRESH HGS solve (no warm starting). The environment
-        tracks the best solution found across all steps. The reward is based
-        on whether this step's result improved the episode-best score.
+        tracks the best solution found across all steps.
+
+        Reward design:
+          - Compare against PREVIOUS step's candidate (not episode-best)
+          - Percentage-based improvement for instance-size normalization
+          - Small negative (-0.5) for no improvement (cost of compute)
+          - Larger penalty (-5.0) for fleet explosions
 
         Args:
             action: 0-6, one of the seven strategy actions.
@@ -378,21 +469,30 @@ class CVRPEnv(gym.Env):
         is_aggressive = action in (1, 4)
         fleet_exploded = (is_aggressive and cand_nv > self._best_nv + 2)
 
+        # --- Reward: percentage improvement over previous candidate ---
         if fleet_exploded:
             self._iters_since_improvement += self.iters_per_step
             reward = self.FAILURE_PENALTY
-        elif cand_score < self._best_score:
-            # New best solution found!
+        elif cand_score < self._prev_cand_score:
+            # Improvement over previous step's candidate
+            pct = (self._prev_cand_score - cand_score) / max(self._prev_cand_score, 1.0)
+            reward = pct * 100.0
+        else:
+            # No improvement — small penalty for wasted compute
+            self._iters_since_improvement += self.iters_per_step
+            reward = -0.5
+
+        # Update best-of-N tracking (still keep the best solution found)
+        if cand_score < self._best_score:
             self._best_nv = cand_nv
             self._best_td = cand_td
             self._best_score = cand_score
             self._iters_since_improvement = 0
-            reward = self._prev_score - cand_score
-        else:
-            self._iters_since_improvement += self.iters_per_step
-            reward = self._prev_score - self._best_score  # 0 if no change
 
-        self._prev_score = self._best_score
+        # Track for next step's reward comparison
+        self._prev_cand_score = cand_score
+        self._last_reward = reward
+        self._last_action = action
 
         terminated = False
         truncated = self._step_count >= self.max_steps
@@ -415,50 +515,22 @@ class CVRPEnv(gym.Env):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _encode_instance(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the GNN Encoder on the current instance to produce embeddings.
-
-        Each node gets 3 features: [x_norm, y_norm, demand/capacity].
-        """
-        data = self._hgs_data
-        x_coords = data["x_coordinates"]
-        y_coords = data["y_coordinates"]
-        demands = data["demands"]
-        capacity = float(data["vehicle_capacity"])
-        num_locs = len(x_coords)
-
-        coords = np.column_stack([x_coords, y_coords]).astype(np.float32)
-
-        # Normalize coordinates to [0, 1]
-        c_min = coords.min(axis=0)
-        c_max = coords.max(axis=0)
-        c_range = c_max - c_min
-        c_range[c_range == 0] = 1.0
-        coords_norm = (coords - c_min) / c_range
-
-        # Normalize demand by capacity
-        demand_norm = (demands / capacity if capacity > 0 else demands).astype(np.float32)
-
-        # Assemble 3-feature input: [x_norm, y_norm, demand/Q]
-        x = np.column_stack([coords_norm, demand_norm])
-        x_t = torch.tensor(x, dtype=torch.float32, device=self.device)
-        pos_t = torch.tensor(coords_norm, dtype=torch.float32, device=self.device)
-        batch_t = torch.zeros(num_locs, dtype=torch.long, device=self.device)
-
-        self.encoder.eval()
-        with torch.no_grad():
-            node_emb, graph_emb = self.encoder(x_t, pos_t, batch_t)
-
-        return graph_emb, node_emb
-
     def _build_observation(self) -> np.ndarray:
-        """Construct the 132-dim observation vector.
+        """Construct the observation vector.
 
-        graph_embedding (128) + solver_stats (4):
-          - time_ratio: step progress through episode
-          - nv_ratio: current best NV / initial NV
-          - score_ratio: current best score / initial score (< 1 means improvement)
-          - stagnation_ratio: steps without improvement / total budget
+        instance_features (7) + solver_stats (7):
+          Instance features (computed once per episode):
+            - size_norm, demand_fill_ratio, mean_dist_norm, std_dist_norm,
+              depot_centrality, demand_cv, capacity_tightness
+
+          Solver stats (updated each step):
+            - time_ratio: step progress through episode
+            - nv_ratio: current best NV / initial NV
+            - score_ratio: current best score / initial score (< 1 means improvement)
+            - stagnation_ratio: steps without improvement / total budget
+            - nv_gap: (best_nv - nv_min) / nv_initial — distance to fleet minimum
+            - last_reward: reward from previous step (clipped to [-5, 10])
+            - last_action_norm: previous action / NUM_ACTIONS
         """
         time_ratio = self._step_count / self.max_steps
 
@@ -470,14 +542,19 @@ class CVRPEnv(gym.Env):
         total_budget = self.max_steps * self.iters_per_step
         stagnation_ratio = self._iters_since_improvement / max(total_budget, 1)
 
-        stats = torch.tensor(
-            [[time_ratio, nv_ratio, score_ratio, stagnation_ratio]],
-            dtype=torch.float32,
-            device=self.device,
-        )
+        nv_gap = (self._best_nv - self._nv_min) / max(self._nv_initial, 1)
 
-        obs = torch.cat([self._graph_embedding, stats], dim=-1)
-        return obs.squeeze(0).cpu().numpy()
+        last_reward_clipped = np.clip(self._last_reward, -5.0, 10.0) / 10.0
+
+        last_action_norm = self._last_action / NUM_ACTIONS
+
+        stats = np.array([
+            time_ratio, nv_ratio, score_ratio, stagnation_ratio,
+            nv_gap, last_reward_clipped, last_action_norm,
+        ], dtype=np.float32)
+
+        obs = np.concatenate([self._instance_features, stats])
+        return obs
 
     def _action_to_params(self, action: int) -> hgs.AlgorithmParameters:
         """Map the agent's discrete action to HGS AlgorithmParameters.

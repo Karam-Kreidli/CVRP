@@ -5,21 +5,21 @@ This is the learning engine. It trains the Fleet Manager to pick better
 solver strategies over time using Proximal Policy Optimization (PPO).
 
 HOW PPO TRAINING WORKS (simplified):
-  1. COLLECT EXPERIENCE: Run 8 episodes, each with 20 steps. The agent picks
+  1. COLLECT EXPERIENCE: Run 8 episodes, each with 50 steps. The agent picks
      actions, the solver runs, and we record (state, action, reward) transitions.
   2. COMPUTE ADVANTAGES: For each transition, calculate "how much better was
      this action compared to the average?" using GAE-λ (Generalized Advantage
      Estimation). This tells us which actions were surprisingly good or bad.
-  3. UPDATE THE POLICY: Run 4 mini-epochs of gradient descent on the collected
+  3. UPDATE THE POLICY: Run 3 mini-epochs of gradient descent on the collected
      data. PPO's "clipped objective" prevents the policy from changing too much
      in one update (stability).
   4. EVALUATE: Run the current policy greedily (no randomness) on 5 fixed
      instances to track real learning progress.
 
 KEY FEATURES:
-  - Reward normalization (Welford's algorithm): Removing a vehicle gives reward ≈ +1000,
-    while polishing routes gives reward ≈ +10. Without normalization, vehicle removals
-    would dominate the gradient signal and destabilize training.
+  - Reward clipping: Rewards are clipped to [-10, 10] to prevent extreme values
+    from destabilizing training. The percentage-based reward design keeps values
+    in a reasonable range naturally.
   - FP16 mixed precision: Halves memory usage on GPU, enabling larger batches.
   - Action masking: Prevents impossible actions from being selected.
   - Linear LR decay: Learning rate decreases from 1e-4 to 5e-5 over training,
@@ -31,7 +31,6 @@ KEY FEATURES:
 from __future__ import annotations
 
 import csv
-import math
 import pathlib
 import shutil
 import time
@@ -45,7 +44,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from src.agent_manager import FleetManager
-from src.solver_engine import CVRPEnv
+from src.solver_engine import CVRPEnv, INSTANCE_FEATURES_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -61,15 +60,15 @@ class PPOConfig:
     """
 
     # --- Reward discounting ---
-    gamma: float = 0.99        # Discount factor for future rewards (0.99 = future matters a lot).
-                                # At each step, future rewards are multiplied by gamma^t.
-                                # gamma=0.99 over 20 steps means the last step's reward is
-                                # worth 0.99^19 ≈ 0.83 of its face value.
+    gamma: float = 0.95        # Discount factor for future rewards.
+                                # With 50 steps/episode, 0.95^50 ≈ 0.077 so the agent
+                                # focuses on local consequences of its actions.
 
-    lam: float = 0.95          # GAE-λ: bias-variance tradeoff for advantage estimation.
+    lam: float = 0.90          # GAE-λ: bias-variance tradeoff for advantage estimation.
                                 # λ=1.0 → high variance, unbiased (Monte Carlo-like)
                                 # λ=0.0 → low variance, biased (TD-like)
-                                # λ=0.95 is a good middle ground for most RL problems.
+                                # λ=0.90 with 50-step episodes gives more bias reduction
+                                # which helps with noisier per-step rewards.
 
     # --- PPO clipping ---
     epsilon_clip: float = 0.2  # PPO clip range: policy ratio is clamped to [1-ε, 1+ε].
@@ -81,8 +80,9 @@ class PPOConfig:
     vf_coeff: float = 0.5     # Weight of the value (critic) loss in the total loss.
                                 # Total loss = policy_loss + 0.5*value_loss - 0.05*entropy
 
-    ent_coeff: float = 0.05   # Entropy bonus: encourages exploration by penalizing
-                                # overly confident policies. Higher values = more randomness.
+    ent_coeff: float = 0.02   # Entropy bonus: encourages exploration by penalizing
+                                # overly confident policies. Lower than before (0.05) because
+                                # 50 steps/episode provides natural exploration diversity.
                                 # If entropy drops to 0, the agent has "collapsed" to always
                                 # picking the same action (bad — it stopped exploring).
 
@@ -91,12 +91,11 @@ class PPOConfig:
                                 # over training (see LinearLR scheduler in MARLTrainer).
 
     # --- Mini-batch training ---
-    ppo_epochs: int = 4        # Number of passes over the collected data per PPO update.
-                                # More epochs = more learning per rollout, but risk overfitting
-                                # to the current batch (hence the KL early stopping below).
+    ppo_epochs: int = 3        # Number of passes over the collected data per PPO update.
+                                # Reduced from 4 to avoid overfitting with larger batches.
 
-    mini_batch_size: int = 64  # Transitions per gradient step. With 8 episodes × 20 steps
-                                # = 160 transitions per rollout, this gives ~2-3 mini-batches.
+    mini_batch_size: int = 128 # Transitions per gradient step. With 8 episodes × 50 steps
+                                # = 400 transitions per rollout, this gives ~3 mini-batches.
 
     max_grad_norm: float = 0.5 # Gradient clipping: prevents exploding gradients by scaling
                                 # down the gradient if its norm exceeds this threshold.
@@ -113,60 +112,11 @@ class PPOConfig:
 
 
 # ---------------------------------------------------------------------------
-# Running Mean/Std for Reward Normalization
+# Reward Clipping
 # ---------------------------------------------------------------------------
 
-class RunningMeanStd:
-    """Welford's online algorithm for tracking running mean and variance.
-
-    WHY DO WE NEED THIS?
-      Rewards in our system have a huge range:
-        - Removing a vehicle: reward ≈ +1000  (huge!)
-        - Polishing routes:   reward ≈ +5 to +50  (small)
-        - Fleet explosion:    reward = -5.0  (penalty)
-
-      If we feed these raw rewards into PPO, the +1000 vehicle rewards would
-      dominate the gradients and cause training instability. By normalizing
-      rewards to roughly unit variance (mean≈0, std≈1), all reward signals
-      contribute proportionally to learning.
-
-    HOW IT WORKS:
-      Uses Welford's algorithm to maintain a running mean and variance
-      that updates incrementally with each batch of rewards. Unlike computing
-      mean/std over the whole history, this is numerically stable and O(1) memory.
-
-      The statistics are saved in checkpoints so they persist across training resumes.
-    """
-
-    def __init__(self, epsilon: float = 1e-8):
-        self.mean = 0.0
-        self.var = 1.0
-        self.count = epsilon  # Small epsilon to avoid division by zero initially
-
-    def update(self, x: np.ndarray):
-        """Update running mean/variance with a new batch of reward values.
-
-        Uses the parallel/batch version of Welford's algorithm to merge
-        the new batch statistics with the running statistics.
-        """
-        batch_mean = np.mean(x)
-        batch_var = np.var(x)
-        batch_count = len(x)
-
-        # Merge running stats with batch stats (parallel Welford's)
-        delta = batch_mean - self.mean
-        total = self.count + batch_count
-        new_mean = self.mean + delta * batch_count / total
-        m_a = self.var * self.count       # Running sum of squared deviations
-        m_b = batch_var * batch_count     # Batch sum of squared deviations
-        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / total
-        self.mean = new_mean
-        self.var = m2 / total
-        self.count = total
-
-    def normalize(self, x: np.ndarray) -> np.ndarray:
-        """Normalize values to approximately zero mean, unit variance."""
-        return (x - self.mean) / (math.sqrt(self.var) + 1e-8)
+REWARD_CLIP_MIN = -10.0
+REWARD_CLIP_MAX = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -192,13 +142,13 @@ class RolloutBuffer:
 
     def store(self, obs, action, log_prob, value, reward, done, action_mask=None):
         """Record one transition (one step of one episode)."""
-        self.observations.append(obs)     # (132,) observation vector
-        self.actions.append(action)       # int: which action was taken (0-5)
+        self.observations.append(obs)     # (OBS_DIM,) observation vector
+        self.actions.append(action)       # int: which action was taken (0-6)
         self.log_probs.append(log_prob)   # float: log π(a|s) at the time of action selection
         self.values.append(value)         # float: V(s) from the critic
         self.rewards.append(reward)       # float: reward received (after normalization)
         self.dones.append(done)           # bool: was this the last step of the episode?
-        self.action_masks.append(action_mask)  # (6,) bool: which actions were allowed
+        self.action_masks.append(action_mask)  # (7,) bool: which actions were allowed
 
     def clear(self):
         """Reset the buffer for a new epoch."""
@@ -307,7 +257,6 @@ class MARLTrainer:
 
         # --- Model ---
         # The Fleet Manager is the only trainable component.
-        # The GNN Encoder is frozen (not trained by PPO — it's part of the environment).
         self.manager = FleetManager().to(device)
 
         # --- Optimizer ---
@@ -336,11 +285,6 @@ class MARLTrainer:
         # Stores all transitions from the current epoch's rollouts.
         # Cleared at the start of each epoch.
         self.buffer = RolloutBuffer()
-
-        # --- Reward Normalization ---
-        # Tracks running mean/std of rewards using Welford's algorithm.
-        # All rewards are normalized before computing advantages.
-        self.reward_rms = RunningMeanStd()
 
         # --- Logging & Tracking ---
         self.epoch_stats: list[dict] = []     # Full history of epoch metrics
@@ -392,12 +336,12 @@ class MARLTrainer:
             done = False
 
             while not done:
-                # Parse observation into graph embedding + solver stats
+                # Parse observation into instance features + solver stats
                 obs_t = torch.tensor(
                     obs, dtype=torch.float32, device=self.device
                 ).unsqueeze(0)
-                graph_emb = obs_t[:, :128]
-                solver_stats = obs_t[:, 128:]
+                graph_emb = obs_t[:, :INSTANCE_FEATURES_DIM]
+                solver_stats = obs_t[:, INSTANCE_FEATURES_DIM:]
 
                 # Build action mask tensor
                 action_mask = info.get("action_mask")
@@ -444,17 +388,17 @@ class MARLTrainer:
 
         For each of the 8 episodes:
           1. Reset the environment (random instance, initial solve)
-          2. For 20 steps:
+          2. For 50 steps:
              - Agent observes state → picks action (STOCHASTIC — with exploration)
              - Environment executes action → returns reward and next state
              - Store the transition in the buffer
           3. Record final score
 
         After all episodes, we:
-          - Normalize all rewards using running statistics (Welford's)
+          - Clip all rewards to [-10, 10]
           - Compute GAE-λ advantages (how good was each action?)
 
-        The buffer now contains ~160 transitions (8 episodes × 20 steps)
+        The buffer now contains ~400 transitions (8 episodes × 50 steps)
         ready for the PPO update.
 
         Returns:
@@ -476,12 +420,12 @@ class MARLTrainer:
             done = False
 
             while not done:
-                # Parse the 132-dim observation into its two components
+                # Parse the observation into its two components
                 obs_t = torch.tensor(
                     obs, dtype=torch.float32, device=self.device
-                ).unsqueeze(0)                          # (1, 132)
-                graph_emb = obs_t[:, :128]              # Instance embedding
-                solver_stats = obs_t[:, 128:]           # 4 solver stats
+                ).unsqueeze(0)                          # (1, OBS_DIM)
+                graph_emb = obs_t[:, :INSTANCE_FEATURES_DIM]              # Instance features (7)
+                solver_stats = obs_t[:, INSTANCE_FEATURES_DIM:]           # Solver stats (7)
 
                 # Build action mask tensor for the Fleet Manager
                 mask_t = None
@@ -497,7 +441,7 @@ class MARLTrainer:
                     )
                 action_int = action.item()
 
-                # Environment executes the action (runs PyVRP for 1000 iterations)
+                # Environment executes the action (runs HGS for 500 iterations)
                 next_obs, reward, terminated, truncated, info = self.env.step(action_int)
                 done = terminated or truncated
 
@@ -532,27 +476,24 @@ class MARLTrainer:
                 f"({ep_mins}m{ep_secs:02d}s)"
             )
 
-        # --- Reward Normalization ---
-        # Update running mean/std with this epoch's raw rewards, then normalize
-        # all rewards in the buffer to roughly unit variance.
-        norm_mag = 0.0
+        # --- Reward Clipping ---
+        # Clip rewards to [-10, 10] to prevent extreme values from
+        # destabilizing training. The percentage-based reward design
+        # keeps most values in a reasonable range naturally.
         if len(self.buffer) > 0:
             raw = np.array(self.buffer.rewards)
-            self.reward_rms.update(raw)               # Update running statistics
-            normed = self.reward_rms.normalize(raw)    # Normalize to ~N(0,1)
-            self.buffer.rewards = normed.tolist()      # Replace raw with normalized
-            norm_mag = float(np.mean(np.abs(normed)))  # Track normalization magnitude
+            clipped = np.clip(raw, REWARD_CLIP_MIN, REWARD_CLIP_MAX)
+            self.buffer.rewards = clipped.tolist()
 
         # --- Compute Advantages ---
         # GAE-λ tells PPO which actions were better/worse than expected.
-        # last_value=0.0 because episodes always end at step 20 (no bootstrap needed).
+        # last_value=0.0 because episodes always end at step 50 (no bootstrap needed).
         if len(self.buffer) > 0:
             self.buffer.compute_gae(0.0, self.config.gamma, self.config.lam)
 
         return {
             "total_steps": total_steps,
             "total_reward": total_reward,
-            "norm_mag": norm_mag,
             "avg_nv": float(np.mean(episode_nvs)),
             "avg_td": float(np.mean(episode_tds)),
             "avg_score": float(np.mean(episode_scores)),
@@ -576,7 +517,7 @@ class MARLTrainer:
           in one update, or training becomes unstable. PPO solves this with
           a "clipped surrogate objective" that limits the policy change.
 
-        The update runs for 4 mini-epochs over the data. If the policy changes
+        The update runs for 3 mini-epochs over the data. If the policy changes
         too much (KL divergence exceeds threshold), we stop early.
 
         Returns:
@@ -621,12 +562,12 @@ class MARLTrainer:
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        T = len(obs)                          # Total transitions (~160)
+        T = len(obs)                          # Total transitions (~400)
         mb_size = min(cfg.mini_batch_size, T)  # Mini-batch size for each gradient step
         total_pl, total_vl, total_ent, n = 0.0, 0.0, 0.0, 0
 
         # --- PPO Mini-Epoch Loop ---
-        # Run 4 passes over the data, each time shuffling and splitting into mini-batches.
+        # Run 3 passes over the data, each time shuffling and splitting into mini-batches.
         for _ in range(cfg.ppo_epochs):
             indices = torch.randperm(T, device=self.device)  # Shuffle transition order
             for start in range(0, T, mb_size):
@@ -644,7 +585,7 @@ class MARLTrainer:
                 with torch.amp.autocast("cuda", enabled=self.amp_enabled):
                     # Get current policy's logits and value estimates
                     logits, values = self.manager(
-                        mb_obs[:, :128], mb_obs[:, 128:],  # graph_emb, solver_stats
+                        mb_obs[:, :INSTANCE_FEATURES_DIM], mb_obs[:, INSTANCE_FEATURES_DIM:],  # instance_features, solver_stats
                         action_mask=mb_mask,
                     )
                     dist = Categorical(logits=logits)
@@ -703,7 +644,7 @@ class MARLTrainer:
             if cfg.target_kl is not None:
                 with torch.no_grad():
                     logits_all, _ = self.manager(
-                        obs[:, :128], obs[:, 128:],
+                        obs[:, :INSTANCE_FEATURES_DIM], obs[:, INSTANCE_FEATURES_DIM:],
                         action_mask=action_masks,
                     )
                     kl = (
@@ -728,7 +669,7 @@ class MARLTrainer:
         """One full training epoch: collect → update → evaluate.
 
         This is the top-level training step called once per epoch:
-          1. Collect rollouts (8 episodes of 20 steps each)
+          1. Collect rollouts (8 episodes of 50 steps each)
           2. PPO update (learn from collected experience)
           3. Step the LR scheduler (linear decay)
           4. Evaluate on fixed instances (track real progress)
@@ -781,7 +722,7 @@ class MARLTrainer:
         fieldnames = [
             "epoch", "avg_nv", "avg_td", "avg_score", "best_score",
             "eval_score", "eval_nv", "eval_td",
-            "num_episodes", "total_reward", "norm_mag", "total_steps",
+            "num_episodes", "total_reward", "total_steps",
             "policy_loss", "value_loss", "entropy", "lr",
         ]
         row = {k: stats.get(k, "") for k in fieldnames}
@@ -813,7 +754,6 @@ class MARLTrainer:
           - Optimizer state (Adam's momentum/variance estimates)
           - LR scheduler state (current position in the decay schedule)
           - FP16 scaler state (loss scaling factor)
-          - Reward normalization statistics (running mean/variance)
           - Training history (all epoch stats)
           - Best eval score (for best-model tracking)
 
@@ -826,11 +766,6 @@ class MARLTrainer:
                 "optimizer": self.optimizer.state_dict(),
                 "scheduler": self.scheduler.state_dict(),
                 "scaler": self.scaler.state_dict(),
-                "reward_rms": {
-                    "mean": self.reward_rms.mean,
-                    "var": self.reward_rms.var,
-                    "count": self.reward_rms.count,
-                },
                 "epoch_stats": self.epoch_stats,
                 "best_score": self.best_score,
             },
@@ -840,13 +775,9 @@ class MARLTrainer:
     def load_checkpoint(self, path: str):
         """Load a checkpoint and restore all training state.
 
-        Restores the model, optimizer, scheduler, scaler, reward normalization
-        statistics, training history, and best score. After calling this,
-        training can continue seamlessly from the checkpoint epoch.
-
-        Note: The reward_rms (running mean/std) restoration is critical —
-        without it, reward normalization would reset to zero, causing a
-        sudden shift in the gradient signal and destabilizing training.
+        Restores the model, optimizer, scheduler, scaler, training history,
+        and best score. After calling this, training can continue seamlessly
+        from the checkpoint epoch.
         """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.manager.load_state_dict(ckpt["manager_state_dict"])
@@ -854,12 +785,6 @@ class MARLTrainer:
         if "scheduler" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler"])
         self.scaler.load_state_dict(ckpt["scaler"])
-
-        # Restore reward normalization statistics
-        rms = ckpt["reward_rms"]
-        self.reward_rms.mean = rms["mean"]
-        self.reward_rms.var = rms["var"]
-        self.reward_rms.count = rms["count"]
 
         self.epoch_stats = ckpt.get("epoch_stats", [])
         self.best_score = ckpt.get("best_score", float("inf"))

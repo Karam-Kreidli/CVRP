@@ -2,7 +2,7 @@
 
 ## 1. System Overview
 
-Our system is an **RL-guided CVRP solver** built for the GECCO 2026 ML4VRP competition. Instead of solving the CVRP directly, we train a Reinforcement Learning agent to **control how** the PyVRP solver runs — deciding when to push for fewer vehicles, when to polish routes, and when to explore new solution regions.
+Our system is an **RL-guided CVRP solver** built for the GECCO 2026 ML4VRP competition. Instead of solving the CVRP directly, we train a Reinforcement Learning agent to **select HGS-CVRP algorithm configurations** — deciding which genetic algorithm parameters to use at each step of the search.
 
 **Competition Objective:**
 ```
@@ -20,7 +20,7 @@ Removing one vehicle saves 1000 distance units — fleet minimization dominates.
 The system has four main components that work together in a pipeline:
 
 ```
-.vrp Instance  -->  GNN Encoder  -->  Fleet Manager  -->  PyVRP Solver
+.vrp Instance  -->  GNN Encoder  -->  Fleet Manager  -->  HGS-CVRP Solver
                     (Stage 1)         (Stage 2)           (Stage 3)
                                                               |
                                                               v
@@ -45,13 +45,13 @@ The system has four main components that work together in a pipeline:
 
 **Why GAT?** Standard GNNs treat all neighbors equally. GAT uses attention to learn *which* neighbors matter most — e.g., a cluster of high-demand customers near capacity limits is more important than spread-out low-demand nodes.
 
-**Parameters:** ~51,600. Computed once per instance, then reused for all 20 steps of an episode.
+**Parameters:** ~51,600. Computed once per instance, then reused for all 5 steps of an episode.
 
 ---
 
 ### Stage 2 — Fleet Manager (`agent_manager.py`)
 
-**What it does:** The RL agent — the "brain" of the system. At each step, it looks at the graph embedding + 4 real-time solver statistics and chooses one of 6 search strategies.
+**What it does:** The RL agent — the "brain" of the system. At each step, it looks at the graph embedding + 4 real-time solver statistics and chooses one of 7 HGS parameter configurations.
 
 **Observation (132-dim vector):**
 ```
@@ -59,21 +59,30 @@ obs = [graph_embedding (128) | solver_stats (4)]
 ```
 
 The 4 solver statistics:
-- **time_ratio** = steps_used / 20 — "How much budget is left?"
+- **time_ratio** = steps_used / 5 — "How much budget is left?"
 - **nv_ratio** = NV_current / NV_initial — "How much fleet reduction so far?"
-- **violation_ratio** = excess_load / total_demand — "Am I pushing too hard?"
+- **score_ratio** = best_score / initial_score — "How much overall improvement?"
 - **stagnation_ratio** = iters_no_improve / budget — "Am I stuck?"
 
-**Action Space (6 discrete actions):**
+**Action Space (7 discrete actions):**
 
-| # | Action | Penalty Increase | Use Case |
-|---|--------|-----------------|----------|
-| 0 | POLISH | Default params | Routes are good, just refine distances |
-| 1 | MILD_PRESSURE | 2x | Gently nudge toward fewer vehicles |
-| 2 | MODERATE_PRESSURE | 5x | Steady, reliable fleet reduction |
-| 3 | AGGRESSIVE_PRESSURE | 10x | Force route merges (risky!) |
-| 4 | EXPLORE_NEW_SEED | Default + new seed | Escape local optima |
-| 5 | EXPLORE_PRESSURE | 5x + new seed | Escape and reduce simultaneously |
+Each action selects a different genetic algorithm configuration. The key parameters controlled are:
+
+- **mu** (min population size): Smaller = faster but less diverse. Larger = more diverse, slower.
+- **lambda_** (offspring count): How many new solutions per generation.
+- **nbGranular**: Local search neighborhood size. Higher = more thorough.
+- **targetFeasible**: Fraction of feasible solutions. Lower = more aggressive exploration.
+- **nbElite / nbClose**: Elite protection and diversity balance.
+
+| # | Action | Strategy | Key Settings |
+|---|--------|----------|------------|
+| 0 | DEFAULT | Standard HGS defaults | mu=25, lambda=40, nbGranular=20, targetFeasible=0.2 |
+| 1 | FAST_AGGRESSIVE | Small pop, speed + pressure | mu=15, lambda=20, nbGranular=15, targetFeasible=0.1 |
+| 2 | LARGE_DIVERSE | Big pop, thorough search | mu=40, lambda=60, nbGranular=30, targetFeasible=0.3 |
+| 3 | DEEP_SEARCH | Deep local search | mu=25, lambda=40, nbGranular=40, targetFeasible=0.2 |
+| 4 | HIGH_TURNOVER | Max churn, high-risk | mu=10, lambda=80, nbGranular=20, targetFeasible=0.05 |
+| 5 | STABLE_ELITE | Conservative refinement | mu=50, lambda=30, nbGranular=25, targetFeasible=0.4 |
+| 6 | EXPLORE_NEW_SEED | Default + fresh random seed | Escapes local optima |
 
 **Network:** Actor-Critic with shared trunk
 ```
@@ -82,40 +91,41 @@ obs (132) --> Linear(132->64) + ReLU --> Linear(64->64) + ReLU
                               +---------------+---------------+
                               |                               |
                          Actor Head                     Critic Head
-                       Linear(64->6)                   Linear(64->1)
+                       Linear(64->7)                   Linear(64->1)
                               |                               |
-                     action_logits (6)                state_value (1)
+                     action_logits (7)                state_value (1)
 ```
 
-- **Actor** outputs a probability distribution over the 6 actions (the policy)
+- **Actor** outputs a probability distribution over the 7 actions (the policy)
 - **Critic** outputs a single number estimating "how good is this state?" (the value function)
 - **Parameters:** ~13,100 — intentionally tiny since it makes strategic decisions, not route computations
 
-**Action Masking:** When the fleet is already at the theoretical minimum (NV = ceil(total_demand / capacity)), pressure actions (1, 2, 3, 5) are blocked by setting their logits to -10,000. After softmax, these become ~0 probability, preventing the agent from wasting steps on impossible fleet reductions.
+**Action Masking:** When the fleet is already at the theoretical minimum (NV = ceil(total_demand / capacity)), the most aggressive actions (1=FAST_AGGRESSIVE, 4=HIGH_TURNOVER) are blocked by setting their logits to -10,000. After softmax, these become ~0 probability, preventing the agent from wasting steps on impossible fleet reductions.
 
 ---
 
 ### Stage 3 — Solver Engine (`solver_engine.py`)
 
-**What it does:** The bridge between the RL world and the actual solver. Implements a Gymnasium environment that wraps PyVRP's Iterated Local Search (ILS) solver.
+**What it does:** The bridge between the RL world and the actual solver. Implements a Gymnasium environment that wraps HGS-CVRP (via the `hygese` Python package).
 
 **Episode lifecycle:**
-1. `reset()` — Pick a random .vrp instance, encode it with the GNN, run an initial 1000-iteration solve
-2. `step(action)` — Translate the action to PyVRP parameters, run 1000 more iterations, compute reward
-3. Repeat `step()` 20 times = 20,000 total ILS iterations per episode
+1. `reset()` — Pick a random .vrp instance, encode it with the GNN, run an initial 5,000-iteration solve with default HGS parameters
+2. `step(action)` — Translate the action to HGS AlgorithmParameters, run a **fresh** 5,000-iteration solve, track the best solution found
+3. Repeat `step()` 5 times = **25,000 total HGS iterations** per episode
 
 **How actions become solver parameters:**
-The Fleet Manager doesn't touch routes directly. It controls PyVRP's **penalty parameters**:
-- **penalty_increase** — How much to raise the penalty for excess vehicles. Higher = more pressure to merge routes.
-- **penalty_decrease** — How quickly the penalty relaxes. Lower = more sustained pressure.
-- **target_feasible** — What fraction of the population should be feasible. Lower = solver explores more aggressively.
-- **seed** — Same seed = continue search (exploitation). New seed = restart from different point (exploration).
+The Fleet Manager doesn't touch routes directly. It controls HGS's **AlgorithmParameters** — the configuration of the genetic algorithm itself:
+- **mu, lambda_** — Population size and offspring count. Controls the balance between exploration and exploitation in the genetic search.
+- **nbGranular** — Neighborhood size for local search. Higher = deeper local optimization.
+- **targetFeasible** — Fraction of population that must be feasible. Lower = solver explores more infeasible intermediate solutions.
+- **nbElite, nbClose** — Elite protection and diversity measurement. Controls whether the GA favors exploitation or exploration.
+- **seed** — Same seed = reproducible search. New seed = different starting point (escape local optima).
 
-**Reward:** `reward = previous_score - new_score` (positive when score improves)
+**Important: No warm starting.** Unlike some solvers, HGS does not accept a previous solution as input. Each step runs a completely fresh solve. The environment tracks the best solution found across all steps in the episode. This means the agent's value comes from finding configurations that consistently produce good results, not from iteratively improving a single solution.
 
-**Safety: Fleet Explosion Detection.** If a pressure action causes NV to spike by more than 2 vehicles, the bad solution is rejected and a penalty of -5.0 is returned. This teaches the agent that aggressive pressure can backfire.
+**Reward:** `reward = previous_best_score - new_best_score` (positive when score improves)
 
-**Warm Starting:** Each step passes the current best solution as the starting point for PyVRP. The solver builds on what it already found rather than starting from scratch.
+**Safety: Fleet Explosion Detection.** If an aggressive action (FAST_AGGRESSIVE or HIGH_TURNOVER) causes NV to spike by more than 2 vehicles, the bad solution is rejected and a penalty of -5.0 is returned. This teaches the agent that aggressive configurations can backfire.
 
 ---
 
@@ -133,14 +143,14 @@ Reinforcement Learning is a paradigm where an **agent** learns to make decisions
 
 In our system:
 - **Agent** = Fleet Manager
-- **Environment** = CVRPEnv (PyVRP solver wrapper)
+- **Environment** = CVRPEnv (HGS-CVRP solver wrapper)
 - **State** = 132-dim observation vector (graph embedding + solver stats)
-- **Action** = One of 6 solver strategies
+- **Action** = One of 7 GA parameter configurations
 - **Reward** = Score improvement (prev_score - new_score)
 
 ### Policy and Value Functions
 
-**Policy (pi):** A probability distribution over actions given a state. The Actor head of our network outputs this. During training, actions are *sampled* from this distribution (enabling exploration). During evaluation, we pick the *argmax* (greedy, no randomness).
+**Policy (pi):** A probability distribution over actions given a state. The Actor head outputs this. During training, actions are *sampled* from this distribution (enabling exploration). During evaluation, we pick the *argmax* (greedy, no randomness).
 
 **Value Function V(s):** The Critic head's estimate of "how much total future reward can we expect from this state?" This is used to compute *advantages* — how much better an action was compared to what we expected.
 
@@ -149,7 +159,7 @@ In our system:
 Our Fleet Manager uses an **Actor-Critic** design with a **shared trunk**:
 
 - The **shared trunk** (two 64-unit layers) extracts features common to both policy and value estimation. Sharing is efficient and keeps the critic's estimates aligned with the actor's policy.
-- The **Actor** head outputs logits for each of the 6 actions. These are converted to probabilities by the Categorical distribution (softmax internally).
+- The **Actor** head outputs logits for each of the 7 actions. These are converted to probabilities by the Categorical distribution (softmax internally).
 - The **Critic** head outputs a scalar V(s). PPO uses this to compute advantages.
 
 ### Advantage Estimation (GAE-lambda)
@@ -170,7 +180,7 @@ delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)     [TD error at step t]
 A_t     = delta_t + gamma * lambda * A_{t+1}      [GAE accumulation]
 ```
 
-The **discount factor gamma=0.99** controls how much future rewards matter. Over 20 steps, the last step's reward is worth 0.99^19 ~ 0.83 of its face value.
+The **discount factor gamma=0.99** controls how much future rewards matter. Over 5 steps, the last step's reward is worth 0.99^4 ~ 0.96 of its face value.
 
 ---
 
@@ -258,7 +268,7 @@ After each mini-epoch, we check how much the policy has changed from the old pol
 
 **The problem:** Rewards in our system have a huge range:
 - Removing a vehicle: ~+1000
-- Polishing routes: ~+5 to +50
+- Good configuration finding lower TD: ~+5 to +50
 - Fleet explosion penalty: -5.0
 
 Without normalization, +1000 vehicle rewards would dominate gradients and destabilize training.
@@ -276,7 +286,7 @@ Training starts with **easier instances** and gradually introduces harder ones:
 - **Epochs 1-20:** Only small instances (N <= 100 customers)
 - **Epochs 21+:** All instances (N up to 400 customers)
 
-**Why?** The agent learns basic strategies (when to push vs. polish) faster on small, quick-to-solve instances. Once it has these fundamentals, it transfers this knowledge to larger, harder instances. Starting on 400-node instances from the beginning would make early learning very slow because each episode takes much longer and the solution space is much larger.
+**Why?** The agent learns basic strategies (which configurations work when) faster on small, quick-to-solve instances. Once it has these fundamentals, it transfers this knowledge to larger, harder instances. Starting on 400-node instances from the beginning would make early learning very slow because each episode takes much longer and the solution space is much larger.
 
 After epoch 20, the agent still sees small instances mixed with large ones — it doesn't forget what it learned.
 
@@ -286,13 +296,13 @@ After epoch 20, the agent still sees small instances mixed with large ones — i
 
 Each epoch follows this cycle:
 
-**Phase 1 — Collect Experience (8 episodes x 20 steps = 160 transitions)**
+**Phase 1 — Collect Experience (4 episodes x 5 steps = 20 transitions)**
 - Reset environment with a random instance
 - Agent observes state, samples action (stochastic — with exploration)
-- Environment executes action (1000 PyVRP iterations), returns reward
+- Environment executes action (5,000 HGS iterations), returns reward
 - Store all transitions in a rollout buffer
 
-**Phase 2 — PPO Update (4 mini-epochs over the 160 transitions)**
+**Phase 2 — PPO Update (4 mini-epochs over the 20 transitions)**
 - Normalize advantages to zero mean, unit variance
 - Shuffle transitions into mini-batches of 64
 - For each mini-batch: compute policy loss + value loss + entropy bonus, do gradient step
@@ -311,15 +321,29 @@ Each epoch follows this cycle:
 
 ---
 
-## 9. File Map
+## 9. Baseline Evaluation (`scripts/baseline_eval.py`)
+
+To demonstrate that the RL agent adds value, we compare against HGS with fixed parameters:
+
+**Single-Solve Baseline (fair comparison):**
+One HGS solve with default parameters (seed=42) per instance — this is what HGS gets without any RL guidance. The RL agent must beat this.
+
+**Best-of-N Baseline (upper bound):**
+Multiple random seeds x 5 steps, keeping the best result — shows what HGS can achieve with brute-force repetition. This is an upper bound, not a fair comparison.
+
+Both baselines use the same iteration budget (5,000 per step) as the RL agent.
+
+---
+
+## 10. File Map
 
 | File | Role | Parameters |
 |------|------|-----------|
 | `model_vision.py` | GNN Encoder — spatial understanding | ~51,600 |
 | `agent_manager.py` | Fleet Manager — RL agent (Actor-Critic) | ~13,100 |
-| `solver_engine.py` | CVRPEnv — Gymnasium environment wrapping PyVRP | — |
+| `solver_engine.py` | CVRPEnv — Gymnasium environment wrapping HGS-CVRP | — |
 | `train.py` | PPO training loop, GAE, reward normalization | — |
 | `main.py` | Entry point, smoke tests, CLI | — |
-| `agent_driver.py` | UNUSED — kept for reference | — |
+| `baseline_eval.py` | HGS baseline evaluation (default vs large-pop) | — |
 
-**Total trainable parameters: ~64,700.** The model is intentionally lightweight. The heavy lifting is done by PyVRP's C++ solver — our RL agent just learns to steer it effectively.
+**Total trainable parameters: ~64,700.** The model is intentionally lightweight. The heavy lifting is done by HGS-CVRP's C++ solver — our RL agent just learns to steer it effectively.
