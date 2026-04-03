@@ -145,7 +145,7 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
         jobs[job_id]["stage_statuses"]["3"] = "running"
         
         stage_3_start = time.time()
-        max_steps = env.MAX_STEPS  # 50 steps with new design
+        max_steps = env.max_steps  # 50 steps with new design
         for step in range(max_steps):
             if jobs[job_id]["status"] == "stopped": return
 
@@ -162,7 +162,7 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
             action = torch.argmax(action_logits).item()
             obs, reward, done, trunc, info = env.step(action)
 
-            jobs[job_id]["iteration"] = (step + 1) * env.ITERS_PER_STEP
+            jobs[job_id]["iteration"] = (step + 1) * env.iters_per_step
             jobs[job_id]["current_nv"] = info.get("nv", 0)
             jobs[job_id]["best_nv"] = info.get("nv", 0)
             jobs[job_id]["current_td"] = round(info.get("td", 0.0), 2)
