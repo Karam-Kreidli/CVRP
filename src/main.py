@@ -234,7 +234,6 @@ EOF
     env = CVRPEnv(
         instance_paths=[vrp_path],
         device=device,
-        iters_per_step=500,
         max_steps=5,
     )
 
@@ -242,7 +241,7 @@ EOF
     assert obs.shape == (OBS_DIM,), f"Expected ({OBS_DIM},), got {obs.shape}"
     print(f"  Reset -> NV={info['nv']}, TD={info['td']:.0f}, score={info['score']:.0f}")
 
-    # Step through actions 0, 2, 6 (DEFAULT, LARGE_DIVERSE, EXPLORE_NEW_SEED)
+    # Step through actions 0, 2, 6 (FREE_SAME, LOCK_SAME, FORCE_MIN)
     total_reward = 0.0
     for action in [0, 2, 6]:
         obs, reward, terminated, truncated, info = env.step(action)
@@ -295,7 +294,6 @@ def smoke_test_training():
     env = CVRPEnv(
         instance_paths=[vrp_path],
         device=device,
-        iters_per_step=100,
         max_steps=3,
     )
 
@@ -384,7 +382,6 @@ EOF
     env = CVRPEnv(
         instance_paths=[vrp_path],
         device=device,
-        iters_per_step=500,
         max_steps=5,
     )
     obs, info = env.reset(seed=42)
@@ -404,14 +401,14 @@ EOF
     inst_feat = torch.tensor(obs[:INSTANCE_FEATURES_DIM], dtype=torch.float32, device=device).unsqueeze(0)
     stats = torch.tensor(obs[INSTANCE_FEATURES_DIM:], dtype=torch.float32, device=device).unsqueeze(0)
 
-    # Force mask: block aggressive actions (1=FAST_AGGRESSIVE, 4=HIGH_TURNOVER)
+    # Force mask: block fleet-reduction actions (4=PUSH_SAME, 5=PUSH_NEW, 6=FORCE_MIN)
     forced_mask = torch.tensor(
-        [[True, False, True, True, False, True, True]], dtype=torch.bool, device=device
+        [[True, True, True, True, False, False, False]], dtype=torch.bool, device=device
     )
     with torch.no_grad():
         logits, _ = manager(inst_feat, stats, action_mask=forced_mask)
 
-    for blocked in [1, 4]:
+    for blocked in [4, 5, 6]:
         assert logits[0, blocked].item() < -1e3, \
             f"Action {blocked} logit should be masked, got {logits[0, blocked].item()}"
 
@@ -421,10 +418,10 @@ EOF
         with torch.no_grad():
             a, _, _ = manager.select_action(inst_feat, stats, action_mask=forced_mask)
         actions.append(a.item())
-    blocked_set = {1, 4}
+    blocked_set = {4, 5, 6}
     sampled_blocked = blocked_set & set(actions)
     assert not sampled_blocked, f"Blocked actions {sampled_blocked} were sampled despite mask!"
-    print(f"  100 masked samples: {set(actions)} (aggressive actions never sampled)")
+    print(f"  100 masked samples: {set(actions)} (fleet-reduction actions never sampled)")
 
     os.remove(vrp_path)
     os.rmdir(tmpdir)

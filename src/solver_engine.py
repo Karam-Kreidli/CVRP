@@ -1,27 +1,31 @@
 """
 Stage 3 - Solver Engine: Gymnasium environment wrapping the HGS-CVRP solver.
 
-This is the BRIDGE between the RL agent and the actual CVRP solver. It translates
-the Fleet Manager's high-level strategy decisions into concrete HGS algorithm
-parameters (population sizes, search granularity, feasibility targets, etc.).
+This is the BRIDGE between the RL agent and the actual CVRP solver. The agent
+makes high-level strategic decisions — whether to push for fewer vehicles,
+try a new random seed, or refine at the current fleet size — and the environment
+translates those into HGS solver calls.
 
 HOW IT WORKS:
   The environment follows the standard Gymnasium (OpenAI Gym) interface:
     1. reset()  — Load a random CVRP instance, compute hand-crafted features, do initial solve
-    2. step(action) — Apply the chosen parameter configuration for a fresh HGS solve
+    2. step(action) — Execute the chosen strategy (fleet target + seed + budget)
     3. Repeat step() MAX_STEPS times → episode ends
 
 WHAT THE ACTIONS ACTUALLY DO:
-  The Fleet Manager controls HGS's ALGORITHM PARAMETERS, which determine the
-  genetic algorithm's population dynamics, search depth, and feasibility pressure:
+  Each action is a (fleet_target, seed_strategy, iteration_budget) tuple.
+  The agent's real decisions are:
+    - Should I try to REDUCE the fleet? (huge score impact but risky)
+    - Should I try a NEW SEED? (escape local optima)
+    - How much COMPUTE to invest? (tighter fleet gets more budget)
 
-  0 = DEFAULT            — HGS defaults (mu=25, lambda=40, nbGranular=20, targetFeasible=0.2)
-  1 = FAST_AGGRESSIVE    — Small pop, low granularity, low feasibility target (speed + pressure)
-  2 = LARGE_DIVERSE      — Big population, high granularity, relaxed feasibility (thorough search)
-  3 = DEEP_SEARCH        — Default pop, very high granularity (deep local search neighborhoods)
-  4 = HIGH_TURNOVER      — Tiny base pop, huge offspring, very low feasibility (maximum churn)
-  5 = STABLE_ELITE       — Large base pop, fewer offspring, high feasibility (conservative)
-  6 = EXPLORE_NEW_SEED   — Default params with a fresh random seed (escape local optima)
+  0 = FREE_SAME       — Let HGS decide fleet, same seed, 500 iters
+  1 = FREE_NEW        — Let HGS decide fleet, new seed, 500 iters
+  2 = LOCK_SAME       — Lock at current best NV, same seed, 500 iters
+  3 = LOCK_NEW        — Lock at current best NV, new seed, 500 iters
+  4 = PUSH_SAME       — Try best_nv - 1, same seed, 1000 iters
+  5 = PUSH_NEW        — Try best_nv - 1, new seed, 1000 iters
+  6 = FORCE_MIN       — Force theoretical minimum NV, new seed, 1500 iters
 
 REWARD:
   Percentage-based improvement over the previous step's candidate score.
@@ -47,17 +51,22 @@ import hygese as hgs
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-INSTANCE_FEATURES_DIM = 7    # Hand-crafted instance features (replaces GNN)
+INSTANCE_FEATURES_DIM = 7    # Hand-crafted instance features
 STATS_DIM = 7                # Solver stats: time, nv_ratio, score_ratio, stagnation, nv_gap, last_reward, last_action
 OBS_DIM = INSTANCE_FEATURES_DIM + STATS_DIM  # 14 = total observation dimension
 NUM_ACTIONS = 7              # Number of discrete strategy choices
-ITERS_PER_STEP = 500         # HGS iterations (nbIter) per environment step
-MAX_STEPS = 50               # Steps per episode (total budget: 500 * 50 = 25,000)
+MAX_STEPS = 50               # Steps per episode
 TIME_PER_STEP = 0.0          # HGS time limit per step (0 = use nbIter only)
 
+# Iteration budgets per action (tighter fleet targets get more compute)
+ITERS_FREE = 500             # Free / lock actions — quick solves
+ITERS_PUSH = 1000            # Push (best_nv - 1) — needs more search
+ITERS_FORCE = 1500           # Force minimum fleet — hardest, gets most budget
+ITERS_PER_STEP = ITERS_FREE  # Default for compatibility (used in train.py logging)
+
 ACTION_NAMES = [
-    "DEFAULT", "FAST_AGGRESSIVE", "LARGE_DIVERSE",
-    "DEEP_SEARCH", "HIGH_TURNOVER", "STABLE_ELITE", "EXPLORE_NEW_SEED",
+    "FREE_SAME", "FREE_NEW", "LOCK_SAME",
+    "LOCK_NEW", "PUSH_SAME", "PUSH_NEW", "FORCE_MIN",
 ]
 
 
@@ -255,32 +264,35 @@ class CVRPEnv(gym.Env):
     EPISODE LIFECYCLE:
       1. reset() picks a random .vrp instance, computes hand-crafted features,
          runs an initial solve with default HGS parameters.
-      2. step(action) maps the chosen action to HGS AlgorithmParameters,
-         runs a fresh solve, and keeps the best solution found across all steps.
+      2. step(action) executes the chosen strategy: sets fleet target, seed,
+         and iteration budget, then runs a fresh HGS solve.
       3. After MAX_STEPS steps, the episode ends (truncated=True).
 
-    NOTE ON WARM STARTING:
-      Unlike PyVRP, HGS does not support warm starting (passing a previous
-      solution). Each step runs a fresh solve. The environment tracks the best
-      solution found across ALL steps in the episode. The agent's job is to
-      find the parameter configuration that produces the best result for each
-      instance.
+    ACTION SPACE:
+      Each action controls three levers:
+        - Fleet target: free / lock at best_nv / push to best_nv-1 / force nv_min
+        - Seed: same seed (reproducible) or new seed (escape local optima)
+        - Iteration budget: 500 (quick) / 1000 (medium) / 1500 (thorough)
 
     Args:
         instance_paths: List of paths to .vrp files (X-dataset format).
         device: Torch device (kept for compatibility, minimal GPU use now).
-        iters_per_step: HGS iterations per step (nbIter parameter).
         max_steps: Steps per episode.
         max_nodes: Curriculum filter — only use instances with <= N customers.
     """
 
     metadata = {"render_modes": []}
 
+    # Iteration budgets per action type
+    ITERS_FREE = ITERS_FREE
+    ITERS_PUSH = ITERS_PUSH
+    ITERS_FORCE = ITERS_FORCE
+    ITERS_PER_STEP = ITERS_PER_STEP  # For backward compat (logging)
+
     def __init__(
         self,
         instance_paths: list[str | pathlib.Path],
         device: torch.device = torch.device("cpu"),
-        iters_per_step: int = ITERS_PER_STEP,
         max_steps: int = MAX_STEPS,
         max_nodes: int | None = None,
     ):
@@ -290,7 +302,6 @@ class CVRPEnv(gym.Env):
         self.max_nodes = max_nodes
         self.instance_paths = self._filter_by_nodes(self._all_instance_paths)
         self.device = device
-        self.iters_per_step = iters_per_step
         self.max_steps = max_steps
 
         # Gymnasium space definitions
@@ -325,15 +336,15 @@ class CVRPEnv(gym.Env):
     def get_action_mask(self) -> np.ndarray:
         """Return a boolean mask over 7 actions. True = allowed, False = blocked.
 
-        When the fleet is already at the theoretical minimum (NV == NV_min),
-        block the high-pressure actions that try to reduce fleet further.
-        Actions 1 (FAST_AGGRESSIVE) and 4 (HIGH_TURNOVER) are the most
-        aggressive; block those when at minimum fleet.
+        Block fleet-reduction actions when they can't possibly help:
+        - PUSH (4,5) blocked when best_nv <= nv_min (can't go lower)
+        - FORCE_MIN (6) blocked when best_nv <= nv_min (already there)
         """
         mask = np.ones(NUM_ACTIONS, dtype=bool)
         if self._best_nv <= self._nv_min:
-            mask[1] = False  # FAST_AGGRESSIVE
-            mask[4] = False  # HIGH_TURNOVER
+            mask[4] = False  # PUSH_SAME
+            mask[5] = False  # PUSH_NEW
+            mask[6] = False  # FORCE_MIN
         return mask
 
     def _filter_by_nodes(self, paths: list[pathlib.Path]) -> list[pathlib.Path]:
@@ -359,18 +370,61 @@ class CVRPEnv(gym.Env):
     # HGS Solver
     # ------------------------------------------------------------------
 
-    def _solve_hgs(self, params: hgs.AlgorithmParameters) -> dict:
+    def _solve_hgs(
+        self,
+        params: hgs.AlgorithmParameters,
+        num_vehicles: int | None = None,
+    ) -> dict:
         """Run HGS-CVRP with the given parameters and return result dict.
+
+        Args:
+            params: HGS algorithm parameters (iterations, seed, etc.)
+            num_vehicles: If set, force HGS to use at most this many vehicles.
+                         None = use the default upper bound (free fleet).
 
         Returns:
             dict with 'nv' (number of vehicles), 'td' (total distance),
             'score' (competition score), 'routes' (list of routes).
         """
-        solver = hgs.Solver(parameters=params, verbose=False)
-        result = solver.solve_cvrp(self._hgs_data, rounding=True)
+        # Temporarily override num_vehicles if a fleet target is specified
+        data = self._hgs_data
+        old_nv = data.get("num_vehicles")
+        if num_vehicles is not None:
+            data["num_vehicles"] = num_vehicles
+
+        try:
+            solver = hgs.Solver(parameters=params, verbose=False)
+            result = solver.solve_cvrp(data, rounding=True)
+        except Exception:
+            # HGS can throw when fleet size is too tight.
+            if num_vehicles is not None:
+                data["num_vehicles"] = old_nv
+            return {
+                "nv": 9999,
+                "td": float("inf"),
+                "score": float("inf"),
+                "routes": [],
+                "failed": True,
+            }
+
+        # Restore original num_vehicles
+        if num_vehicles is not None:
+            data["num_vehicles"] = old_nv
 
         nv = len(result.routes)
         td = result.cost
+
+        # HGS silently returns 0 routes / 0 cost when it can't find a
+        # feasible solution with the constrained fleet size.
+        if nv == 0 or td <= 0:
+            return {
+                "nv": 9999,
+                "td": float("inf"),
+                "score": float("inf"),
+                "routes": [],
+                "failed": True,
+            }
+
         return {
             "nv": nv,
             "td": td,
@@ -403,10 +457,10 @@ class CVRPEnv(gym.Env):
         # Compute hand-crafted instance features (replaces GNN)
         self._instance_features = _compute_instance_features(self._hgs_data)
 
-        # Initial solve with default HGS parameters
+        # Initial solve with default HGS parameters (free fleet, standard budget)
         default_params = hgs.AlgorithmParameters(
             timeLimit=TIME_PER_STEP,
-            nbIter=self.iters_per_step,
+            nbIter=ITERS_FREE,
             seed=self._seed,
         )
         result = self._solve_hgs(default_params)
@@ -435,16 +489,18 @@ class CVRPEnv(gym.Env):
     FAILURE_PENALTY = -5.0
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
-        """Execute one HGS solve with the chosen parameter configuration.
+        """Execute one HGS solve with the chosen strategy.
 
-        Each step runs a FRESH HGS solve (no warm starting). The environment
-        tracks the best solution found across all steps.
+        Each action controls three levers:
+          - Fleet target: free / lock best_nv / push best_nv-1 / force nv_min
+          - Seed: same (reproducible) or new (escape local optima)
+          - Iteration budget: 500 / 1000 / 1500 (tighter fleet = more compute)
 
         Reward design:
           - Compare against PREVIOUS step's candidate (not episode-best)
           - Percentage-based improvement for instance-size normalization
           - Small negative (-0.5) for no improvement (cost of compute)
-          - Larger penalty (-5.0) for fleet explosions
+          - Larger penalty (-5.0) for fleet explosions (NV spike > 2)
 
         Args:
             action: 0-6, one of the seven strategy actions.
@@ -455,31 +511,34 @@ class CVRPEnv(gym.Env):
         assert self._hgs_data is not None, "Must call reset() before step()"
         self._step_count += 1
 
-        # Translate action to HGS parameters
-        params = self._action_to_params(action)
+        # Translate action to (HGS params, fleet target)
+        params, num_vehicles, iters_used = self._action_to_params(action)
 
-        # Run fresh HGS solve
-        result = self._solve_hgs(params)
+        # Run fresh HGS solve with optional fleet constraint
+        result = self._solve_hgs(params, num_vehicles=num_vehicles)
 
+        solve_failed = result.get("failed", False)
         cand_nv = result["nv"]
         cand_td = result["td"]
         cand_score = result["score"]
 
-        # Check for fleet explosion on aggressive actions
-        is_aggressive = action in (1, 4)
-        fleet_exploded = (is_aggressive and cand_nv > self._best_nv + 2)
+        # Check for fleet explosion (NV spiked by more than 2 vs best)
+        # Also triggered by a failed solve (nv=9999)
+        fleet_exploded = solve_failed or (cand_nv > self._best_nv + 2)
 
         # --- Reward: percentage improvement over previous candidate ---
         if fleet_exploded:
-            self._iters_since_improvement += self.iters_per_step
+            self._iters_since_improvement += iters_used
             reward = self.FAILURE_PENALTY
+            # Don't let failed solve corrupt candidate tracking
+            cand_score = self._prev_cand_score
         elif cand_score < self._prev_cand_score:
             # Improvement over previous step's candidate
             pct = (self._prev_cand_score - cand_score) / max(self._prev_cand_score, 1.0)
             reward = pct * 100.0
         else:
             # No improvement — small penalty for wasted compute
-            self._iters_since_improvement += self.iters_per_step
+            self._iters_since_improvement += iters_used
             reward = -0.5
 
         # Update best-of-N tracking (still keep the best solution found)
@@ -539,7 +598,9 @@ class CVRPEnv(gym.Env):
         initial_score = competition_score(self._nv_initial, self._best_td)
         score_ratio = self._best_score / max(initial_score, 1.0)
 
-        total_budget = self.max_steps * self.iters_per_step
+        # Approximate total budget (using average per-step iters for normalization)
+        avg_iters = (ITERS_FREE + ITERS_PUSH + ITERS_FORCE) / 3.0
+        total_budget = self.max_steps * avg_iters
         stagnation_ratio = self._iters_since_improvement / max(total_budget, 1)
 
         nv_gap = (self._best_nv - self._nv_min) / max(self._nv_initial, 1)
@@ -556,128 +617,54 @@ class CVRPEnv(gym.Env):
         obs = np.concatenate([self._instance_features, stats])
         return obs
 
-    def _action_to_params(self, action: int) -> hgs.AlgorithmParameters:
-        """Map the agent's discrete action to HGS AlgorithmParameters.
+    def _action_to_params(
+        self, action: int
+    ) -> tuple[hgs.AlgorithmParameters, int | None, int]:
+        """Map the agent's discrete action to (HGS params, fleet target, iters_used).
 
-        Each action configures a different genetic algorithm strategy:
+        Each action is a (fleet_target, seed_strategy, iteration_budget) combo:
 
-        mu (min pop size): Smaller = faster generations, less diversity.
-                           Larger = more diverse population, slower convergence.
+          0 = FREE_SAME   — Free fleet, same seed, 500 iters
+          1 = FREE_NEW    — Free fleet, new seed, 500 iters
+          2 = LOCK_SAME   — Lock at best_nv, same seed, 500 iters
+          3 = LOCK_NEW    — Lock at best_nv, new seed, 500 iters
+          4 = PUSH_SAME   — Push to best_nv-1, same seed, 1000 iters
+          5 = PUSH_NEW    — Push to best_nv-1, new seed, 1000 iters
+          6 = FORCE_MIN   — Force nv_min, new seed, 1500 iters
 
-        lambda_ (offspring size): Controls how many new solutions are generated
-                                  before survivors are selected. Higher = more
-                                  exploration per generation.
-
-        nbGranular: Size of the local search neighborhood. Higher = more thorough
-                    but slower local search. Key quality-vs-speed tradeoff.
-
-        targetFeasible: Fraction of population that should be feasible. Lower =
-                        more infeasible solutions allowed = explores harder but
-                        riskier. Higher = conservative, more feasible solutions.
-
-        nbElite: Number of elite (best) solutions protected from replacement.
-                 More elites = more exploitation, fewer = more exploration.
-
-        nbClose: Number of neighbors used for diversity calculation.
-                 Affects the balance between cost and diversity in fitness.
+        Returns:
+            params: HGS AlgorithmParameters
+            num_vehicles: fleet target (None = free, int = forced)
+            iters_used: iteration budget for this step
         """
-        if action == 0:
-            # DEFAULT: Standard HGS parameters — the baseline configuration.
-            return hgs.AlgorithmParameters(
-                timeLimit=TIME_PER_STEP,
-                nbIter=self.iters_per_step,
-                seed=self._seed,
-            )
-
-        elif action == 1:
-            # FAST_AGGRESSIVE: Small population, low granularity, low feasibility.
-            # Fastest generations, maximum pressure to reduce vehicles.
-            # Trades solution quality for speed and fleet reduction.
-            return hgs.AlgorithmParameters(
-                timeLimit=TIME_PER_STEP,
-                nbIter=self.iters_per_step,
-                seed=self._seed,
-                mu=15,
-                lambda_=20,
-                nbGranular=15,
-                targetFeasible=0.1,
-                nbElite=2,
-                nbClose=3,
-            )
-
-        elif action == 2:
-            # LARGE_DIVERSE: Big population, high granularity, relaxed feasibility.
-            # Thorough search with diverse solution pool — best for hard instances.
-            return hgs.AlgorithmParameters(
-                timeLimit=TIME_PER_STEP,
-                nbIter=self.iters_per_step,
-                seed=self._seed,
-                mu=40,
-                lambda_=60,
-                nbGranular=30,
-                targetFeasible=0.3,
-                nbElite=6,
-                nbClose=8,
-            )
-
-        elif action == 3:
-            # DEEP_SEARCH: Default population, very high granularity.
-            # Maximum local search depth — good for instances where route
-            # structure is nearly optimal but distances can be polished.
-            return hgs.AlgorithmParameters(
-                timeLimit=TIME_PER_STEP,
-                nbIter=self.iters_per_step,
-                seed=self._seed,
-                mu=25,
-                lambda_=40,
-                nbGranular=40,
-                targetFeasible=0.2,
-                nbElite=4,
-                nbClose=5,
-            )
-
-        elif action == 4:
-            # HIGH_TURNOVER: Tiny base pop, huge offspring count, very low feasibility.
-            # Maximum churn — generates many solutions but keeps very few.
-            # Aggressive exploration strategy that's high-risk, high-reward.
-            return hgs.AlgorithmParameters(
-                timeLimit=TIME_PER_STEP,
-                nbIter=self.iters_per_step,
-                seed=self._seed,
-                mu=10,
-                lambda_=80,
-                nbGranular=20,
-                targetFeasible=0.05,
-                nbElite=2,
-                nbClose=3,
-            )
-
-        elif action == 5:
-            # STABLE_ELITE: Large base pop, fewer offspring, high feasibility.
-            # Conservative strategy — maintains a large pool of good feasible
-            # solutions and refines them slowly. Good when close to optimal.
-            return hgs.AlgorithmParameters(
-                timeLimit=TIME_PER_STEP,
-                nbIter=self.iters_per_step,
-                seed=self._seed,
-                mu=50,
-                lambda_=30,
-                nbGranular=25,
-                targetFeasible=0.4,
-                nbElite=8,
-                nbClose=7,
-            )
-
-        elif action == 6:
-            # EXPLORE_NEW_SEED: Default params but with a fresh random seed.
-            # Restarts the stochastic search from a different starting point.
-            # Use when stagnated — a new seed can find completely different solutions.
+        # Determine seed
+        new_seed = action in (1, 3, 5, 6)
+        if new_seed:
             self._seed = random.randint(0, 2**31)
-            return hgs.AlgorithmParameters(
-                timeLimit=TIME_PER_STEP,
-                nbIter=self.iters_per_step,
-                seed=self._seed,
-            )
 
+        # Determine fleet target and iteration budget
+        if action in (0, 1):
+            # FREE: let HGS decide fleet size
+            num_vehicles = None
+            iters = ITERS_FREE
+        elif action in (2, 3):
+            # LOCK: constrain to current best fleet size
+            num_vehicles = self._best_nv
+            iters = ITERS_FREE
+        elif action in (4, 5):
+            # PUSH: try one fewer vehicle than current best
+            num_vehicles = max(self._nv_min, self._best_nv - 1)
+            iters = ITERS_PUSH
+        elif action == 6:
+            # FORCE_MIN: force theoretical minimum fleet
+            num_vehicles = self._nv_min
+            iters = ITERS_FORCE
         else:
             raise ValueError(f"Invalid action: {action}. Expected 0-6.")
+
+        params = hgs.AlgorithmParameters(
+            timeLimit=TIME_PER_STEP,
+            nbIter=iters,
+            seed=self._seed,
+        )
+        return params, num_vehicles, iters

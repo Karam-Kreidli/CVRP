@@ -131,11 +131,11 @@ def main():
     parser = argparse.ArgumentParser(description="HGS-CVRP Baseline Evaluation")
     parser.add_argument("--instance_path", type=str, required=True,
                         help="Directory containing .vrp files")
-    parser.add_argument("--nb_iter", type=int, default=5000,
-                        help="HGS iterations per solve (should match RL iters_per_step)")
+    parser.add_argument("--nb_iter", type=int, default=25000,
+                        help="HGS iterations per solve (default: 25000 = RL budget of 50 steps x 500 iters)")
     parser.add_argument("--num_seeds", type=int, default=3,
                         help="Number of random seeds to average over")
-    parser.add_argument("--num_steps", type=int, default=5,
+    parser.add_argument("--num_steps", type=int, default=1,
                         help="Number of solves per instance (to match RL episode steps)")
     parser.add_argument("--all", action="store_true",
                         help="Run on ALL instances, not just the 5 eval ones")

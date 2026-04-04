@@ -2,14 +2,14 @@
 Stage 2 - Fleet Manager: The RL agent that controls the solver.
 
 This is the "brain" of the system. It looks at hand-crafted instance features
-and real-time solver statistics, then decides which HGS parameter configuration
-to use for the next solve step.
+and real-time solver statistics, then decides the solving strategy for the
+next step: whether to push for fewer vehicles, try a new seed, or refine.
 
 WHAT IT DOES:
   At each of the 50 steps in an episode, the Fleet Manager looks at:
     1. Instance features (7-dim — size, demand, distance stats, etc.)
     2. Seven real-time statistics from the solver ("how is the search going?")
-  And chooses one of 7 HGS parameter configurations for the next solve.
+  And chooses one of 7 strategic actions for the next solve.
 
 OBSERVATION (what the agent sees):
   14-dim vector = [instance_features (7) | solver_stats (7)]
@@ -23,13 +23,14 @@ OBSERVATION (what the agent sees):
       nv_gap, last_reward, last_action_norm
 
 ACTION SPACE (what the agent can do):
-  0 = DEFAULT            — Standard HGS parameters (the baseline)
-  1 = FAST_AGGRESSIVE    — Small pop, low granularity, low feasibility (speed + pressure)
-  2 = LARGE_DIVERSE      — Big population, high granularity, relaxed feasibility
-  3 = DEEP_SEARCH        — Default pop, very high granularity (deep local search)
-  4 = HIGH_TURNOVER      — Tiny base pop, huge offspring, very low feasibility
-  5 = STABLE_ELITE       — Large base pop, fewer offspring, high feasibility
-  6 = EXPLORE_NEW_SEED   — Default params with a fresh random seed
+  Each action controls (fleet_target, seed_strategy, iteration_budget):
+  0 = FREE_SAME    — Free fleet, same seed, 500 iters
+  1 = FREE_NEW     — Free fleet, new seed, 500 iters
+  2 = LOCK_SAME    — Lock best NV, same seed, 500 iters
+  3 = LOCK_NEW     — Lock best NV, new seed, 500 iters
+  4 = PUSH_SAME    — Push best_nv-1, same seed, 1000 iters
+  5 = PUSH_NEW     — Push best_nv-1, new seed, 1000 iters
+  6 = FORCE_MIN    — Force nv_min, new seed, 1500 iters
 
 ARCHITECTURE: Actor-Critic
   The network has two "heads" sharing a common trunk:
@@ -56,8 +57,8 @@ NUM_FLEET_ACTIONS = 7
 
 # Human-readable names for each action (used in logging and debugging)
 ACTION_NAMES = [
-    "DEFAULT", "FAST_AGGRESSIVE", "LARGE_DIVERSE",
-    "DEEP_SEARCH", "HIGH_TURNOVER", "STABLE_ELITE", "EXPLORE_NEW_SEED",
+    "FREE_SAME", "FREE_NEW", "LOCK_SAME",
+    "LOCK_NEW", "PUSH_SAME", "PUSH_NEW", "FORCE_MIN",
 ]
 
 
@@ -127,11 +128,10 @@ class FleetManager(nn.Module):
           - How good the current situation is overall (value)
 
         ACTION MASKING:
-          When the fleet is already at the theoretical minimum (NV == NV_min),
-          it's impossible to reduce further. We set the logits of pressure
-          actions (1, 2, 3, 5) to -10000, which makes their probability
-          essentially zero after softmax. This prevents the agent from wasting
-          steps on impossible fleet reductions.
+          When the fleet is already at the theoretical minimum (NV <= NV_min),
+          fleet-reduction actions (4=PUSH_SAME, 5=PUSH_NEW, 6=FORCE_MIN) are
+          blocked by setting their logits to -10000, making their probability
+          essentially zero after softmax.
 
         Args:
             graph_embedding: (B, 7) hand-crafted instance features.

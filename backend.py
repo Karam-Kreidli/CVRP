@@ -162,7 +162,7 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
             action = torch.argmax(action_logits).item()
             obs, reward, done, trunc, info = env.step(action)
 
-            jobs[job_id]["iteration"] = (step + 1) * env.iters_per_step
+            jobs[job_id]["iteration"] = step + 1  # step count (budget varies per action)
             jobs[job_id]["current_nv"] = info.get("nv", 0)
             jobs[job_id]["best_nv"] = info.get("nv", 0)
             jobs[job_id]["current_td"] = round(info.get("td", 0.0), 2)
