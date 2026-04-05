@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 
-We are building an **RL-guided CVRP solver** for the GECCO 2026 ML4VRP competition. The system uses a Reinforcement Learning agent to dynamically select **HGS-CVRP algorithm parameter configurations**, learning *which* genetic algorithm strategy works best for each instance and search phase.
+We are building an **RL-guided CVRP solver** for the GECCO 2026 ML4VRP competition. The system uses a Reinforcement Learning agent to make **fleet-target strategy decisions** — choosing whether to push for fewer vehicles, lock the current fleet, or try a new random seed at each step of the search.
 
 **Competition Objective:**
 ```
@@ -53,16 +53,16 @@ The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance 
                 |  Output: action (0-6) |
                 +-----------------------+
                             |
-                   action (config choice)
+                   action (strategy choice)
                             |
                             v
                 +-----------------------+
                 |   HGS-CVRP Solver     |
                 |   (C++ genetic alg)   |
                 |                       |
-                |  Runs 500 iterations  |
-                |  with GA parameters   |
-                |  set by the action    |
+                |  Runs 500-1500 iters  |
+                |  with fleet target +  |
+                |  seed set by action   |
                 |                       |
                 |  Output: CVRP solution|
                 +-----------------------+
@@ -108,7 +108,7 @@ The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance 
 
 ### 3.2 Fleet Manager (`src/agent_manager.py`)
 
-**Purpose:** The RL agent. Decides which HGS parameter configuration to use at each step.
+**Purpose:** The RL agent. Decides the fleet-target strategy at each step — whether to push for fewer vehicles, lock the current fleet size, or try a new random seed.
 
 **Observation (14-dim):**
 ```
@@ -127,19 +127,21 @@ obs = [ instance_features (7) | solver_stats (7) ]
 
 **Action Space (7 discrete actions):**
 
-Each action maps to a different HGS genetic algorithm configuration controlling population sizes, search granularity, feasibility targets, and elite management:
+Each action controls three dimensions: **fleet target** (how many vehicles to allow), **seed strategy** (same or new random seed), and **iteration budget** (how much compute to spend):
 
-| # | Action | Strategy | Key Parameters |
-|---|---|---|---|
-| 0 | DEFAULT | Standard HGS defaults | mu=25, lambda=40, nbGranular=20 |
-| 1 | FAST_AGGRESSIVE | Small pop, speed + pressure | mu=15, lambda=20, targetFeasible=0.1 |
-| 2 | LARGE_DIVERSE | Big pop, thorough search | mu=40, lambda=60, nbGranular=30 |
-| 3 | DEEP_SEARCH | Deep local search neighborhoods | mu=25, lambda=40, nbGranular=40 |
-| 4 | HIGH_TURNOVER | Maximum churn, high-risk | mu=10, lambda=80, targetFeasible=0.05 |
-| 5 | STABLE_ELITE | Conservative, large elite pool | mu=50, lambda=30, targetFeasible=0.4 |
-| 6 | EXPLORE_NEW_SEED | Default params, fresh seed | Escapes local optima |
+| # | Action | Fleet Target | Seed | Iters | Strategy |
+|---|---|---|---|---|---|
+| 0 | FREE_SAME | Unconstrained | Same | 500 | Quick solve, no fleet pressure |
+| 1 | FREE_NEW | Unconstrained | New | 500 | Fresh start, no fleet pressure |
+| 2 | LOCK_SAME | Lock best NV | Same | 500 | Optimize TD at current fleet size |
+| 3 | LOCK_NEW | Lock best NV | New | 500 | Fresh start at current fleet size |
+| 4 | PUSH_SAME | best_nv - 1 | Same | 1000 | Try to remove one vehicle |
+| 5 | PUSH_NEW | best_nv - 1 | New | 1000 | Fresh start, remove one vehicle |
+| 6 | FORCE_MIN | nv_min | New | 1500 | Force theoretical minimum fleet |
 
-**Action Masking:** When NV = NV_min (theoretical minimum fleet = ceil(total_demand / capacity)), the most aggressive actions (1=FAST_AGGRESSIVE, 4=HIGH_TURNOVER) are blocked to prevent impossible fleet reductions.
+The key insight: removing one vehicle saves 1000 in score, but forcing fewer vehicles can fail entirely. The agent must learn **when** pushing is worth the risk — this is instance-dependent and changes as the search progresses.
+
+**Action Masking:** When NV <= NV_min (theoretical minimum fleet = ceil(total_demand / capacity)), actions 4, 5, 6 (PUSH_SAME, PUSH_NEW, FORCE_MIN) are blocked since further fleet reduction is impossible.
 
 **Network:**
 ```
@@ -181,33 +183,27 @@ reset()
   |
   v
 step(action) x 50 times
-  |-> Map action to HGS AlgorithmParameters
-  |-> Run FRESH solver for 500 iterations
+  |-> Map action to (fleet_target, seed, iteration_budget)
+  |-> Run FRESH solver for 500-1500 iterations
   |-> Track best solution across all steps
   |-> Compute reward (pct improvement vs previous candidate)
   |-> Return (obs, reward, done, info)
   |
   v
-Episode ends after 50 steps (= 25,000 total HGS iterations)
+Episode ends after 50 steps (~25,000-33,000 total HGS iterations)
 ```
-
-**Why 500 iterations per step (not 5,000)?**
-
-At 5,000 iterations, HGS has essentially converged — the population has stabilized and different configs produce nearly identical results. At 500 iterations, HGS is still actively searching, so the choice of config genuinely affects the outcome. This gives the RL agent meaningful signal to learn from.
-
-50 steps instead of 5 also means 10x more gradient signal per episode for PPO.
 
 **How actions map to solver behavior:**
 
-The Fleet Manager doesn't directly modify routes. Instead, it controls HGS's **genetic algorithm parameters**, which determine population dynamics, search depth, and feasibility pressure:
+The Fleet Manager doesn't directly modify routes. It controls two key levers:
 
-- **mu (min pop size):** Smaller = faster generations, less diversity. Larger = more diverse, slower convergence.
-- **lambda_ (offspring size):** How many new solutions per generation. Higher = more exploration.
-- **nbGranular:** Local search neighborhood size. Higher = more thorough but slower.
-- **targetFeasible:** Fraction of population that should be feasible. Lower = more aggressive exploration.
-- **nbElite / nbClose:** Elite protection and diversity balance.
+1. **Fleet target** (`num_vehicles` parameter in HGS): Constrains how many vehicles HGS can use. Setting this to `best_nv - 1` forces HGS to find a solution with one fewer vehicle — if it succeeds, that's a 1000-point score improvement. But if the instance is too tight, HGS fails entirely.
 
-**Key difference from warm-starting solvers:** Each step runs a **fresh** HGS solve (no warm starting). The environment tracks the best solution found across ALL steps in the episode. The agent's job is to find the parameter configuration that produces the best result.
+2. **Random seed**: Same seed reproduces the same search trajectory. A new seed explores a different region of the solution space, potentially escaping local optima.
+
+3. **Iteration budget**: Harder tasks (PUSH, FORCE) get more iterations (1000-1500) since finding feasible solutions with fewer vehicles requires deeper search.
+
+**Key difference from warm-starting solvers:** Each step runs a **fresh** HGS solve (no warm starting). The environment tracks the best solution found across ALL steps in the episode.
 
 **Reward design:**
 ```python
@@ -242,7 +238,7 @@ For each of 8 episodes:
     2. For 50 steps:
         - Agent observes state
         - Agent picks action (with exploration)
-        - Environment executes action (fresh HGS solve, 500 iters)
+        - Environment executes action (fresh HGS solve, 500-1500 iters)
         - Store (state, action, reward, ...) in buffer
     3. Compute GAE advantages
 
@@ -309,8 +305,8 @@ This helps the agent learn basic strategies on easier problems before tackling h
            |
            v
      HGS solves with
-     chosen GA parameters
-     (500 iterations)
+     chosen fleet target + seed
+     (500-1500 iterations)
            |
            v
      New solution
@@ -403,9 +399,9 @@ Reference scores from the literature are in `docs/benchmark_reference.md` (Uchoa
 
 ### The Core Idea
 
-The competition asks us to find the best CVRP solution (lowest `1000*NV + TD`). HGS-CVRP is already an excellent solver — but it uses **fixed parameters**. The same population sizes, granularity, and feasibility targets are applied regardless of whether the instance has tight clusters, spread-out customers, balanced demand, or skewed demand.
+The competition asks us to find the best CVRP solution (lowest `1000*NV + TD`). HGS-CVRP is already an excellent solver — but with default parameters it uses an unconstrained fleet. It doesn't strategically explore whether fewer vehicles could yield a better competition score.
 
-Our RL agent learns to **adapt the GA configuration to each instance and each moment in the search**. It's not solving the CVRP itself — it's learning to be a better operator of HGS than any fixed configuration could be.
+Our RL agent learns **when to push for fewer vehicles and when to back off**. Since removing one vehicle saves 1000 points but can fail on tight instances, this is a genuinely learnable, instance-dependent decision. The agent isn't solving the CVRP itself — it's learning to be a strategic operator of HGS.
 
 ### How Does the Agent Understand the Problem?
 
@@ -426,21 +422,21 @@ At each step, the agent sees 7 real-time signals from the solver:
 
 ### The Learning Process
 
-The agent doesn't know the right configuration in advance. It learns through trial and error over thousands of episodes:
+The agent doesn't know when to push for fewer vehicles in advance. It learns through trial and error over thousands of episodes:
 
-1. Early in training, the agent picks configurations randomly
-2. Sometimes FAST_AGGRESSIVE works and produces a lower score -> positive reward
-3. Sometimes HIGH_TURNOVER backfires and the fleet explodes -> penalty (-5.0)
-4. Sometimes LARGE_DIVERSE finds a better solution through thorough search -> reward
-5. Sometimes EXPLORE_NEW_SEED escapes a local optimum -> breakthrough
+1. Early in training, the agent picks strategies randomly
+2. Sometimes PUSH succeeds and removes a vehicle -> reward of +1.97 (huge score improvement)
+3. Sometimes PUSH fails and the fleet explodes -> penalty (-5.0)
+4. Sometimes LOCK_SAME optimizes distance at the current fleet size -> small positive reward
+5. Sometimes FREE_NEW with a fresh seed escapes a local optimum -> breakthrough
 
-Over time, PPO adjusts the policy so the agent picks configurations that led to positive outcomes more often.
+Over time, PPO adjusts the policy so the agent learns: "for this type of instance with this much slack, PUSH is worth the risk" vs. "this instance is too tight, just LOCK and optimize distance."
 
 ### Analogy
 
 Think of HGS as a race car and the Fleet Manager as the driver:
 - The **car** (HGS) has all the power — it does the actual route optimization
-- The **driver** (Fleet Manager) decides when to use aggressive settings (speed mode), when to use conservative settings (cruise mode), and when to restart from a different starting point
+- The **driver** (Fleet Manager) decides when to push for fewer vehicles (aggressive overtake), when to lock the current fleet and optimize distance (cruise mode), and when to try a new seed (restart from a different position)
 - The **track** (CVRP instance) is different every time — the features describe the track layout
 - **Training** is the driver practicing on many different tracks until they develop good instincts
 - A car on autopilot with fixed settings will finish the race, but a skilled driver adapts to each track and gets a better time

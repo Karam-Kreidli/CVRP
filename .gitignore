@@ -66,3 +66,5 @@ CHANGES_SUMMARY.txt
 # Duplicate/old notebooks
 notebooks/colab_bridge_modified.ipynb
 notebooks/colab_bridge_new.ipynb
+
+solutions/

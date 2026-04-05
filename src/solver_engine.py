@@ -526,29 +526,27 @@ class CVRPEnv(gym.Env):
         # Also triggered by a failed solve (nv=9999)
         fleet_exploded = solve_failed or (cand_nv > self._best_nv + 2)
 
-        # --- Reward: percentage improvement over previous candidate ---
+        # --- Reward: percentage improvement over episode best ---
         if fleet_exploded:
             self._iters_since_improvement += iters_used
             reward = self.FAILURE_PENALTY
-            # Don't let failed solve corrupt candidate tracking
-            cand_score = self._prev_cand_score
-        elif cand_score < self._prev_cand_score:
-            # Improvement over previous step's candidate
-            pct = (self._prev_cand_score - cand_score) / max(self._prev_cand_score, 1.0)
+            cand_score = self._best_score  # Don't let failed solve corrupt tracking
+        elif cand_score < self._best_score:
+            # Beat the episode best — this is a real improvement
+            pct = (self._best_score - cand_score) / max(self._best_score, 1.0)
             reward = pct * 100.0
         else:
-            # No improvement — small penalty for wasted compute
+            # No improvement over best — small penalty for wasted compute
             self._iters_since_improvement += iters_used
             reward = -0.5
 
-        # Update best-of-N tracking (still keep the best solution found)
+        # Update best-of-N tracking
         if cand_score < self._best_score:
             self._best_nv = cand_nv
             self._best_td = cand_td
             self._best_score = cand_score
             self._iters_since_improvement = 0
 
-        # Track for next step's reward comparison
         self._prev_cand_score = cand_score
         self._last_reward = reward
         self._last_action = action

@@ -2,7 +2,7 @@
 
 ## 1. System Overview
 
-Our system is an **RL-guided CVRP solver** built for the GECCO 2026 ML4VRP competition. Instead of solving the CVRP directly, we train a Reinforcement Learning agent to **select HGS-CVRP algorithm configurations** — deciding which genetic algorithm parameters to use at each step of the search.
+Our system is an **RL-guided CVRP solver** built for the GECCO 2026 ML4VRP competition. Instead of solving the CVRP directly, we train a Reinforcement Learning agent to make **fleet-target strategy decisions** — choosing whether to push for fewer vehicles, lock the current fleet, or try a new random seed at each step of the search.
 
 **Competition Objective:**
 ```
@@ -47,7 +47,7 @@ Computed once per instance at episode start, then reused for all 50 steps. No le
 
 ### Stage 2 — Fleet Manager (`agent_manager.py`)
 
-**What it does:** The RL agent — the "brain" of the system. At each step, it looks at the 7 instance features + 7 real-time solver statistics and chooses one of 7 HGS parameter configurations.
+**What it does:** The RL agent — the "brain" of the system. At each step, it looks at the 7 instance features + 7 real-time solver statistics and chooses one of 7 fleet-target strategies.
 
 **Observation (14-dim vector):**
 ```
@@ -65,23 +65,19 @@ The 7 solver statistics:
 
 **Action Space (7 discrete actions):**
 
-Each action selects a different genetic algorithm configuration. The key parameters controlled are:
+Each action controls three dimensions: **fleet target** (how many vehicles to allow), **seed strategy** (same or new random seed), and **iteration budget** (how much compute to spend):
 
-- **mu** (min population size): Smaller = faster but less diverse. Larger = more diverse, slower.
-- **lambda_** (offspring count): How many new solutions per generation.
-- **nbGranular**: Local search neighborhood size. Higher = more thorough.
-- **targetFeasible**: Fraction of feasible solutions. Lower = more aggressive exploration.
-- **nbElite / nbClose**: Elite protection and diversity balance.
+| # | Action | Fleet Target | Seed | Iters | Strategy |
+|---|---|---|---|---|---|
+| 0 | FREE_SAME | Unconstrained | Same | 500 | Quick solve, no fleet pressure |
+| 1 | FREE_NEW | Unconstrained | New | 500 | Fresh start, no fleet pressure |
+| 2 | LOCK_SAME | Lock best NV | Same | 500 | Optimize TD at current fleet size |
+| 3 | LOCK_NEW | Lock best NV | New | 500 | Fresh start at current fleet size |
+| 4 | PUSH_SAME | best_nv - 1 | Same | 1000 | Try to remove one vehicle |
+| 5 | PUSH_NEW | best_nv - 1 | New | 1000 | Fresh start, remove one vehicle |
+| 6 | FORCE_MIN | nv_min | New | 1500 | Force theoretical minimum fleet |
 
-| # | Action | Strategy | Key Settings |
-|---|--------|----------|------------|
-| 0 | DEFAULT | Standard HGS defaults | mu=25, lambda=40, nbGranular=20, targetFeasible=0.2 |
-| 1 | FAST_AGGRESSIVE | Small pop, speed + pressure | mu=15, lambda=20, nbGranular=15, targetFeasible=0.1 |
-| 2 | LARGE_DIVERSE | Big pop, thorough search | mu=40, lambda=60, nbGranular=30, targetFeasible=0.3 |
-| 3 | DEEP_SEARCH | Deep local search | mu=25, lambda=40, nbGranular=40, targetFeasible=0.2 |
-| 4 | HIGH_TURNOVER | Max churn, high-risk | mu=10, lambda=80, nbGranular=20, targetFeasible=0.05 |
-| 5 | STABLE_ELITE | Conservative refinement | mu=50, lambda=30, nbGranular=25, targetFeasible=0.4 |
-| 6 | EXPLORE_NEW_SEED | Default + fresh random seed | Escapes local optima |
+The key insight: removing one vehicle saves 1000 in score, but forcing fewer vehicles can fail entirely. The agent must learn **when** pushing is worth the risk.
 
 **Network:** Actor-Critic with shared trunk
 ```
@@ -99,7 +95,7 @@ obs (14) --> Linear(14->64) + ReLU --> Linear(64->64) + ReLU
 - **Critic** outputs a single number estimating "how good is this state?" (the value function)
 - **Parameters:** ~5,700 — intentionally tiny since it makes strategic decisions, not route computations
 
-**Action Masking:** When the fleet is already at the theoretical minimum (NV = ceil(total_demand / capacity)), the most aggressive actions (1=FAST_AGGRESSIVE, 4=HIGH_TURNOVER) are blocked by setting their logits to -10,000. After softmax, these become ~0 probability, preventing the agent from wasting steps on impossible fleet reductions.
+**Action Masking:** When the fleet is already at the theoretical minimum (NV <= NV_min = ceil(total_demand / capacity)), actions 4, 5, 6 (PUSH_SAME, PUSH_NEW, FORCE_MIN) are blocked by setting their logits to -10,000. After softmax, these become ~0 probability, preventing the agent from attempting impossible fleet reductions.
 
 ---
 
@@ -109,20 +105,18 @@ obs (14) --> Linear(14->64) + ReLU --> Linear(64->64) + ReLU
 
 **Episode lifecycle:**
 1. `reset()` — Pick a random .vrp instance, compute hand-crafted features, run an initial 500-iteration solve with default HGS parameters
-2. `step(action)` — Translate the action to HGS AlgorithmParameters, run a **fresh** 500-iteration solve, track the best solution found
-3. Repeat `step()` 50 times = **25,000 total HGS iterations** per episode
+2. `step(action)` — Translate the action to (fleet_target, seed, iteration_budget), run a **fresh** 500-1500 iteration solve, track the best solution found
+3. Repeat `step()` 50 times = **~25,000-33,000 total HGS iterations** per episode
 
 **Why 500 iterations per step?**
 
 At 5,000 iterations (the previous design), HGS had essentially converged — the population stabilized and all 7 actions produced identical results. The agent got zero reward signal and couldn't learn. At 500 iterations, HGS is still actively searching, so different configs produce meaningfully different outcomes.
 
 **How actions become solver parameters:**
-The Fleet Manager doesn't touch routes directly. It controls HGS's **AlgorithmParameters** — the configuration of the genetic algorithm itself:
-- **mu, lambda_** — Population size and offspring count. Controls the balance between exploration and exploitation in the genetic search.
-- **nbGranular** — Neighborhood size for local search. Higher = deeper local optimization.
-- **targetFeasible** — Fraction of population that must be feasible. Lower = solver explores more infeasible intermediate solutions.
-- **nbElite, nbClose** — Elite protection and diversity measurement.
+The Fleet Manager doesn't touch routes directly. It controls two key levers:
+- **num_vehicles** — Constrains how many vehicles HGS can use. Setting this to `best_nv - 1` forces HGS to find a solution with one fewer vehicle. If it succeeds, that's a 1000-point score improvement. If it fails, the result is discarded.
 - **seed** — Same seed = reproducible search. New seed = different starting point (escape local optima).
+- **iteration budget** — Harder tasks (PUSH, FORCE) get more iterations (1000-1500) since finding feasible solutions with fewer vehicles requires deeper search.
 
 **Important: No warm starting.** HGS does not accept a previous solution as input. Each step runs a completely fresh solve. The environment tracks the best solution found across all steps in the episode.
 
@@ -162,7 +156,7 @@ In our system:
 - **Agent** = Fleet Manager
 - **Environment** = CVRPEnv (HGS-CVRP solver wrapper)
 - **State** = 14-dim observation vector (instance features + solver stats)
-- **Action** = One of 7 GA parameter configurations
+- **Action** = One of 7 fleet-target strategies (FREE/LOCK/PUSH/FORCE x SAME/NEW seed)
 - **Reward** = Percentage improvement over previous candidate (or -0.5 / -5.0 penalties)
 
 ### Policy and Value Functions
@@ -310,7 +304,7 @@ Each epoch follows this cycle:
 **Phase 1 — Collect Experience (8 episodes x 50 steps = 400 transitions)**
 - Reset environment with a random instance
 - Agent observes state, samples action (stochastic — with exploration)
-- Environment executes action (500 HGS iterations), returns reward
+- Environment executes action (fresh HGS solve, 500-1500 iters), returns reward
 - Store all transitions in a rollout buffer
 
 **Phase 2 — PPO Update (3 mini-epochs over the 400 transitions)**
