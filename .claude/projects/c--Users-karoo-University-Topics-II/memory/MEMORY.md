@@ -1,1 +1,0 @@
-- [ML4VRP 2026 Overview](project_overview.md) — GECCO 2026 MARL+GNN CVRP solver, 5-stage architecture, competition entry
