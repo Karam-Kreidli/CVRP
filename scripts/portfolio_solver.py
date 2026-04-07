@@ -94,26 +94,40 @@ def parse_vrp_file(path: pathlib.Path) -> dict:
 # ---------------------------------------------------------------------------
 # Parameter Configurations (portfolio of HGS strategies)
 # ---------------------------------------------------------------------------
-
+# Each config varies four main HGS knobs:
+#   mu             — Min population size (larger = more diversity, slower per iter)
+#   lambda_        — Max population size (controls how many solutions HGS keeps)
+#   nbGranular     — Neighbourhood size for local search (larger = broader moves)
+#   targetFeasible — Target fraction of feasible solutions in population
+#   nbElite        — Number of elite solutions to preserve between generations
+#   nbClose        — Number of "close" solutions considered in crossover
+#
+# The key insight: different configs work better on different instance types.
+# DEFAULT is HGS's hand-tuned baseline; the others explore different trade-offs
+# between population diversity, search depth, and feasibility pressure.
 CONFIGS = {
-    "DEFAULT": {},
-    "FAST_AGGRESSIVE": dict(mu=15, lambda_=20, nbGranular=15, targetFeasible=0.1, nbElite=2, nbClose=3),
-    "LARGE_DIVERSE": dict(mu=40, lambda_=60, nbGranular=30, targetFeasible=0.3, nbElite=6, nbClose=8),
-    "DEEP_SEARCH": dict(mu=25, lambda_=40, nbGranular=40, targetFeasible=0.2, nbElite=4, nbClose=5),
-    "HIGH_TURNOVER": dict(mu=10, lambda_=80, nbGranular=20, targetFeasible=0.05, nbElite=2, nbClose=3),
-    "STABLE_ELITE": dict(mu=50, lambda_=30, nbGranular=25, targetFeasible=0.4, nbElite=8, nbClose=7),
-    "LARGE_POP": dict(mu=50, lambda_=80, nbGranular=30, targetFeasible=0.2, nbElite=6, nbClose=7),
-    "TINY_AGGRESSIVE": dict(mu=5, lambda_=15, nbGranular=10, targetFeasible=0.05, nbElite=1, nbClose=2),
-    "WIDE_SEARCH": dict(mu=30, lambda_=50, nbGranular=50, targetFeasible=0.25, nbElite=5, nbClose=6),
-    "CONSERVATIVE": dict(mu=60, lambda_=20, nbGranular=20, targetFeasible=0.5, nbElite=10, nbClose=8),
-    "BALANCED_EXPLORE": dict(mu=20, lambda_=60, nbGranular=25, targetFeasible=0.15, nbElite=3, nbClose=4),
-    "MAX_GRANULAR": dict(mu=25, lambda_=40, nbGranular=60, targetFeasible=0.2, nbElite=4, nbClose=5),
+    "DEFAULT":          {},  # HGS hand-tuned defaults — the baseline to beat
+    "FAST_AGGRESSIVE":  dict(mu=15, lambda_=20,  nbGranular=15, targetFeasible=0.1,  nbElite=2,  nbClose=3),
+    "LARGE_DIVERSE":    dict(mu=40, lambda_=60,  nbGranular=30, targetFeasible=0.3,  nbElite=6,  nbClose=8),
+    "DEEP_SEARCH":      dict(mu=25, lambda_=40,  nbGranular=40, targetFeasible=0.2,  nbElite=4,  nbClose=5),
+    "HIGH_TURNOVER":    dict(mu=10, lambda_=80,  nbGranular=20, targetFeasible=0.05, nbElite=2,  nbClose=3),
+    "STABLE_ELITE":     dict(mu=50, lambda_=30,  nbGranular=25, targetFeasible=0.4,  nbElite=8,  nbClose=7),
+    "LARGE_POP":        dict(mu=50, lambda_=80,  nbGranular=30, targetFeasible=0.2,  nbElite=6,  nbClose=7),
+    "TINY_AGGRESSIVE":  dict(mu=5,  lambda_=15,  nbGranular=10, targetFeasible=0.05, nbElite=1,  nbClose=2),
+    "WIDE_SEARCH":      dict(mu=30, lambda_=50,  nbGranular=50, targetFeasible=0.25, nbElite=5,  nbClose=6),
+    "CONSERVATIVE":     dict(mu=60, lambda_=20,  nbGranular=20, targetFeasible=0.5,  nbElite=10, nbClose=8),
+    "BALANCED_EXPLORE": dict(mu=20, lambda_=60,  nbGranular=25, targetFeasible=0.15, nbElite=3,  nbClose=4),
+    "MAX_GRANULAR":     dict(mu=25, lambda_=40,  nbGranular=60, targetFeasible=0.2,  nbElite=4,  nbClose=5),
 }
 
 
 def solve_one(instance_path: str, config_name: str, config_params: dict,
               nb_iter: int, seed: int) -> dict:
-    """Run a single HGS solve. Designed to be called in a process pool."""
+    """Run a single HGS solve. Designed to be called in a process pool.
+
+    Each call is one (instance, config, seed) combination. The process pool
+    runs many of these in parallel across all available CPU cores.
+    """
     path = pathlib.Path(instance_path)
     data = parse_vrp_file(path)
 
@@ -183,8 +197,10 @@ def main():
     print(f"  Workers: {args.workers}")
     print()
 
-    # Submit all solves to the process pool
-    best_per_instance = {}  # instance_name -> best result dict
+    # Submit all (instance × config × seed) combinations to the process pool.
+    # Each future is one HGS solve. We collect results as they complete and
+    # track only the best score per instance.
+    best_per_instance = {}  # instance_name -> best result dict so far
     start_time = time.time()
     completed = 0
 
@@ -193,7 +209,7 @@ def main():
         for inst_path in instance_paths:
             for config_name, config_params in CONFIGS.items():
                 for seed_idx in range(args.num_seeds):
-                    seed = 42 + seed_idx * 1000
+                    seed = 42 + seed_idx * 1000  # Deterministic seed sequence
                     fut = pool.submit(
                         solve_one, str(inst_path), config_name, config_params,
                         args.nb_iter, seed
@@ -205,6 +221,7 @@ def main():
             completed += 1
             inst = result["instance"]
 
+            # Keep only the best-scoring result for each instance
             if inst not in best_per_instance or result["score"] < best_per_instance[inst]["score"]:
                 best_per_instance[inst] = result
 
