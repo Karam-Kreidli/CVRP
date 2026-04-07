@@ -14,18 +14,14 @@ env/
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Jupyter checkpoints
-.ipynb_checkpoints/
 
 # Training artifacts (generated at runtime)
-logs/
-checkpoints/
-*.pth
 
 # Dataset (large, downloaded via scripts/setup_vm.sh)
 
