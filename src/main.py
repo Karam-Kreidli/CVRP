@@ -3,13 +3,11 @@ ML4VRP 2026 - RL-Guided CVRP Solver
 Primary entry point: training loop and smoke tests.
 
 This file has two modes:
-  1. No arguments → runs all smoke tests to verify the pipeline works end-to-end
+  1. No arguments → runs smoke tests to verify the pipeline works end-to-end
   2. "train" subcommand → runs the full PPO training loop
 
 SMOKE TESTS verify each stage of the pipeline independently:
-  - Stage 1: GNN Encoder (single, batched, FP16)
   - Stage 2: Fleet Manager (forward pass, action sampling, FP16)
-  - Stage 1+2: End-to-end pipeline (GNN → Fleet Manager)
   - Stage 3: CVRPEnv (HGS-CVRP wrapper with real solver)
   - Stage 5: Training loop (2 PPO iterations on synthetic data)
   - Stage 6: Action masking (NV_min calculation and mask enforcement)
@@ -27,89 +25,6 @@ import shutil
 import time
 
 import torch
-
-
-def smoke_test():
-    """Verify GNNEncoder runs on a synthetic CVRP instance."""
-    from src.model_vision import GNNEncoder
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder = GNNEncoder().to(device)
-
-    # Synthetic instance: 1 depot + 99 customers = 100 nodes
-    N = 100
-    coords = torch.rand(N, 2)
-    demands = torch.rand(N, 1)
-    demands[0] = 0.0  # depot has no demand
-
-    x = torch.cat([coords, demands], dim=-1).to(device)
-    pos = coords.to(device)
-    batch = torch.zeros(N, dtype=torch.long, device=device)
-
-    node_emb, graph_emb = encoder(x, pos, batch)
-
-    assert node_emb.shape == (100, 128), f"Expected (100, 128), got {node_emb.shape}"
-    assert graph_emb.shape == (1, 128), f"Expected (1, 128), got {graph_emb.shape}"
-
-    print(f"  Node embeddings: {node_emb.shape}")
-    print(f"  Graph embedding: {graph_emb.shape}")
-    print(f"  Parameters: {sum(p.numel() for p in encoder.parameters()):,}")
-    print("  PASSED")
-
-
-def smoke_test_fp16():
-    """Verify AMP compatibility on GPU."""
-    from src.model_vision import GNNEncoder
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type != "cuda":
-        print("  Skipped (no GPU)")
-        return
-
-    encoder = GNNEncoder().to(device)
-    N = 400
-    x = torch.rand(N, 3, device=device)
-    x[0, 2] = 0.0
-    pos = x[:, :2]
-    batch = torch.zeros(N, dtype=torch.long, device=device)
-
-    with torch.amp.autocast("cuda"):
-        node_emb, graph_emb = encoder(x, pos, batch)
-
-    assert node_emb.shape == (400, 128)
-    assert graph_emb.shape == (1, 128)
-    print(f"  Node embeddings dtype: {node_emb.dtype}")
-    print(f"  Graph embedding dtype:  {graph_emb.dtype}")
-    print("  PASSED")
-
-
-def smoke_test_batched():
-    """Verify batched processing with variable-size graphs."""
-    from torch_geometric.data import Data, Batch
-    from src.model_vision import GNNEncoder
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder = GNNEncoder().to(device)
-
-    graphs = []
-    total_nodes = 0
-    for n in [101, 201, 301, 401]:
-        coords = torch.rand(n, 2)
-        demands = torch.rand(n, 1)
-        demands[0] = 0.0
-        x = torch.cat([coords, demands], dim=-1)
-        graphs.append(Data(x=x, pos=coords))
-        total_nodes += n
-
-    batch = Batch.from_data_list(graphs).to(device)
-    node_emb, graph_emb = encoder(batch.x, batch.pos, batch.batch)
-
-    assert node_emb.shape == (total_nodes, 128), f"Expected ({total_nodes}, 128), got {node_emb.shape}"
-    assert graph_emb.shape == (4, 128), f"Expected (4, 128), got {graph_emb.shape}"
-
-    print(f"  Batched node embeddings: {node_emb.shape}")
-    print(f"  Batched graph embeddings: {graph_emb.shape}")
-    print("  PASSED")
 
 
 def smoke_test_fleet_manager():
@@ -648,17 +563,11 @@ if __name__ == "__main__":
     if args.mode == "train":
         train(args)
     else:
-        print("=== Stage 1: Single Instance ===")
-        smoke_test()
-        print("\n=== Stage 1: FP16 (400 nodes) ===")
-        smoke_test_fp16()
-        print("\n=== Stage 1: Batched (variable sizes) ===")
-        smoke_test_batched()
-        print("\n=== Stage 2: Fleet Manager (7 actions) ===")
+        print("=== Stage 2: Fleet Manager (7 actions) ===")
         smoke_test_fleet_manager()
         print("\n=== Stage 2: Fleet Manager FP16 ===")
         smoke_test_fleet_manager_fp16()
-        print("\n=== Stage 1+2: Instance Features -> Fleet Manager Pipeline ===")
+        print("\n=== Stage 2: Instance Features -> Fleet Manager Pipeline ===")
         smoke_test_pipeline()
         print("\n=== Stage 3: CVRPEnv (HGS-CVRP wrapper, 7 actions) ===")
         smoke_test_cvrp_env()

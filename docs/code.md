@@ -124,15 +124,15 @@ The Fleet Manager doesn't touch routes directly. It controls two key levers:
 ```python
 if fleet_exploded:
     reward = -5.0                           # NV spiked by >2
-elif cand_score < prev_cand_score:
-    pct = (prev_cand - cand) / prev_cand
-    reward = pct * 100.0                    # percentage improvement
+elif cand_score < best_score:
+    pct = (best_score - cand_score) / best_score
+    reward = pct * 100.0                    # percentage improvement over episode best
 else:
     reward = -0.5                           # small cost for no improvement
 ```
 
 Key properties:
-- Compares against **previous step's candidate** (not episode-best) — agent gets signal every step
+- Compares against **episode best** (not the previous step's candidate) — reward is only positive when a new best solution is found, giving an unambiguous signal
 - **Percentage-based** — normalizes across different instance sizes
 - Small negative for no improvement teaches the agent to avoid wasteful actions
 
@@ -338,7 +338,6 @@ This guarantees competition-ready solutions regardless of whether RL training su
 
 | File | Role | Parameters |
 |------|------|-----------|
-| `model_vision.py` | GNN Encoder (legacy, not used in training) | ~51,600 |
 | `agent_manager.py` | Fleet Manager — RL agent (Actor-Critic) | ~5,700 |
 | `solver_engine.py` | CVRPEnv — Gymnasium environment wrapping HGS-CVRP | — |
 | `train.py` | PPO training loop, GAE, reward clipping | — |

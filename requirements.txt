@@ -1,10 +1,16 @@
+# ML4VRP 2026 - RL-Guided CVRP Solver
+# Install with: pip install -r requirements.txt
+#
+# Note: hygese requires a C++ compiler (GCC/Clang on Linux/macOS, MSVC on Windows).
+# On Ubuntu: sudo apt-get install build-essential
+# On macOS:  xcode-select --install
+#
+# For GPU training (recommended), install the CUDA-enabled PyTorch build:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# then install the remaining packages:
+#   pip install -r requirements.txt
+
 torch>=2.0
-torch-geometric
-torch-scatter
-torch-sparse
-torch-cluster
-torch-spline-conv
-pyvrp
-gymnasium
-numpy
-matplotlib
+numpy>=1.24
+gymnasium>=0.29
+hygese>=0.0.1

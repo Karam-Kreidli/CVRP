@@ -27,44 +27,6 @@ logs/
 checkpoints/
 *.pth
 
-# Dataset (downloaded at runtime via setup_vm.sh)
-data/
+# Dataset (large, downloaded via scripts/setup_vm.sh)
 
-# Temp/scratch files from earlier development
-*.bat
-*.txt
-*.js
-apply_changes.py
-edit_notebook.py
-execute_directly.py
-execute_patch.py
-executor.py
-fix_cell6.js
-fix_notebook.py
-format_notebook.py
-modify_notebook.py
-notebook_modifier.py
-patch_nb.py
-patch_notebook.py
-run_format.py
-run_patch.py
-temp_modify.py
-test_patch.py
-update_notebook.py
-verify_modifications.py
-verify_notebook.py
-colab_bridge_modified.ipynb
-EXECUTION_REPORT.md
-FINAL_MODIFICATION_REPORT.md
-IMPLEMENTATION_CODE.md
-MODIFICATION_SUMMARY.md
-README_MODIFICATIONS.md
-VERIFICATION_REPORT.md
-BEFORE_AFTER_COMPARISON.txt
-CHANGES_SUMMARY.txt
-
-# Duplicate/old notebooks
-notebooks/colab_bridge_modified.ipynb
-notebooks/colab_bridge_new.ipynb
-
-solutions/
+# Competition solutions output

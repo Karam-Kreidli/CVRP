@@ -209,15 +209,15 @@ The Fleet Manager doesn't directly modify routes. It controls two key levers:
 ```python
 if fleet_exploded:
     reward = -5.0                    # penalty for NV spike
-elif cand_score < prev_cand_score:
-    pct = (prev_cand - cand) / prev_cand
-    reward = pct * 100.0             # percentage improvement
+elif cand_score < best_score:
+    pct = (best_score - cand_score) / best_score
+    reward = pct * 100.0             # percentage improvement over episode best
 else:
     reward = -0.5                    # small cost for no improvement
 ```
 
 Key properties:
-- Compares against **previous step's candidate** (not episode-best), so the agent gets signal every step
+- Compares against **episode best** (not the previous step's candidate) — reward is only positive when a new best is found, giving an unambiguous learning signal
 - **Percentage-based** — normalizes across different instance sizes
 - Small negative for no improvement teaches the agent to avoid wasteful actions
 
@@ -327,7 +327,6 @@ This helps the agent learn basic strategies on easier problems before tackling h
 
 ```
 src/
-  model_vision.py    - GNN Encoder (legacy, not used in training pipeline)
   agent_manager.py   - Fleet Manager RL agent (Stage 2)
   solver_engine.py   - HGS-CVRP Gymnasium environment (Stage 3)
   train.py           - PPO training loop (Stage 5)
