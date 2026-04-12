@@ -38,11 +38,10 @@ The web app calls this on startup to show the green "SYSTEM READY" dot in the si
   "gpu_name": "NVIDIA T4",
   "model_loaded": true,
   "stage_health": {
-    "gnn_observer": 1.00,
-    "fleet_manager": 1.00,
+    "feature_extractor": 1.00,
+    "fleet_manager": 0.84,
     "hgs_engine": 1.00,
-    "route_driver": 0.88,
-    "maca_trainer": 0.61
+    "ppo_trainer": 0.84
   },
   "total_training_epochs": 84,
   "best_score_ever": 54702.7
@@ -54,15 +53,15 @@ The web app calls this on startup to show the green "SYSTEM READY" dot in the si
 | `status` | string | `"ready"` or `"loading"` or `"error"` |
 | `device` | string | `"cuda"` or `"cpu"` |
 | `gpu_name` | string | GPU name, or `"CPU only"` |
-| `model_loaded` | bool | Whether GNNEncoder + agents are loaded |
-| `stage_health.gnn_observer` | float 0–1 | GNN encoder training convergence. Use `1.0` once training is complete. |
-| `stage_health.fleet_manager` | float 0–1 | Fleet Manager PPO agent convergence ratio (e.g. current epoch / total epochs). |
-| `stage_health.hgs_engine` | float 0–1 | Always `1.0` — HGS is a classical solver, not trained. |
-| `stage_health.route_driver` | float 0–1 | Route Driver PPO agent convergence ratio. |
-| `stage_health.maca_trainer` | float 0–1 | Reward propagation training progress. |
-| `total_training_epochs` | int | How many PPO training epochs have completed so far. |
-| `best_score_ever` | float | The lowest `1000×NV + TD` score achieved across all training runs. |
+| `model_loaded` | bool | Whether the Fleet Manager weights are loaded |
+| `stage_health.feature_extractor` | float 0–1 | Always `1.0` — deterministic computation, no training required |
+| `stage_health.fleet_manager` | float 0–1 | Actor-Critic PPO convergence: `current_epoch / total_epochs` |
+| `stage_health.hgs_engine` | float 0–1 | Always `1.0` — HGS is a classical solver, not trained |
+| `stage_health.ppo_trainer` | float 0–1 | Same as `fleet_manager` — reflects PPO training progress |
+| `total_training_epochs` | int | How many PPO training epochs have completed so far |
+| `best_score_ever` | float | Lowest `1000×NV + TD` score achieved across all training runs |
 
+> **Note:** `stage_health` now has **4 keys** matching the 4-stage pipeline (Feature Extractor → Fleet Manager → HGS Engine → PPO Trainer). The old keys `gnn_observer`, `route_driver`, and `maca_trainer` are **removed**.
 
 ---
 
@@ -73,7 +72,7 @@ POST /solve
 Content-Type: multipart/form-data
 ```
 
-Called when the user uploads a `.vrp` file and clicks **Run Solver**. Starts the 5-stage pipeline as a background job and immediately returns a `job_id`.
+Called when the user uploads a `.vrp` file and clicks **Run Solver**. Starts the 4-stage pipeline as a background job and immediately returns a `job_id`.
 
 **Request body** — multipart form with:
 
@@ -105,7 +104,7 @@ Called when the user uploads a `.vrp` file and clicks **Run Solver**. Starts the
 | `num_nodes` | int | Total nodes including depot (from `DIMENSION` in file) |
 | `vehicle_capacity` | int | From `CAPACITY` in the `.vrp` file |
 | `total_demand` | int | Sum of all customer demands |
-| `nv_min` | int | `ceil(total_demand / vehicle_capacity)` — theoretical floor |
+| `nv_min` | int | `ceil(total_demand / vehicle_capacity)` — theoretical fleet floor |
 
 ---
 
@@ -128,15 +127,13 @@ The web app calls this **every 500ms** while a job is running to update the live
     "1": "done",
     "2": "done",
     "3": "running",
-    "4": "waiting",
-    "5": "waiting"
+    "4": "waiting"
   },
   "stage_times_seconds": {
-    "1": 0.4,
-    "2": 1.1,
+    "1": 0.02,
+    "2": 0.4,
     "3": null,
-    "4": null,
-    "5": null
+    "4": null
   },
   "current_nv": 29,
   "best_nv": 26,
@@ -144,15 +141,19 @@ The web app calls this **every 500ms** while a job is running to update the live
   "best_td": 28702.7,
   "current_score": 60241.8,
   "best_score": 54702.7,
-  "iteration": 2841,
-  "max_iterations": 10000,
+  "iteration": 8500,
+  "max_iterations": 25000,
   "elapsed_seconds": 36,
+  "current_action": "PUSH_NEW",
+  "episode_step": 17,
+  "episode_step_max": 50,
+  "nv_min": 25,
   "log_lines": [
-    "[00:00.412] [GNN] Graph embedding complete — 128-dim vector (101 nodes)",
-    "[00:01.108] [FM] Strategic mode: ROUTE_ELIMINATION (target NV=25)",
-    "[00:01.110] [HGS] Crossover SREX initiated — pop size 20",
-    "[00:03.884] [HGS] New best: NV=26 TD=28702.7 score=54702.7",
-    "[00:04.201] [HGS] Running iteration 2841 / 10000..."
+    "[00:00.022] [FE] Feature extraction complete — 7-dim vector (100 customers)",
+    "[00:00.412] [FM] Step 16: action=LOCK_SAME fleet_target=26 seed=same iters=500",
+    "[00:00.838] [HGS] New best: NV=26 TD=28702.7 score=54702.7",
+    "[00:01.108] [FM] Step 17: action=PUSH_NEW fleet_target=25 seed=new iters=1000",
+    "[00:03.201] [HGS] Running step 17 / 50 — iteration 8500 / 25000..."
   ]
 }
 ```
@@ -160,30 +161,35 @@ The web app calls this **every 500ms** while a job is running to update the live
 | Field | Type | Description |
 |---|---|---|
 | `status` | string | `"running"`, `"complete"`, `"error"`, `"not_found"` |
-| `current_stage` | int | 1–5, which stage is actively running |
+| `current_stage` | int | 1–4, which stage is actively running |
 | `stage_name` | string | Human-readable name of current stage |
-| `stage_statuses` | object | Per-stage: `"done"`, `"running"`, `"waiting"`, `"error"` |
-| `stage_times_seconds` | object | How long each stage took (null if not finished) |
-| `current_nv` | int | NV of the current solution being evaluated |
-| `best_nv` | int | Best NV found so far |
-| `current_td` | float | TD of current solution |
+| `stage_statuses` | object | Per-stage: `"done"`, `"running"`, `"waiting"`, `"error"` — keys `"1"` through `"4"` |
+| `stage_times_seconds` | object | How long each stage took in seconds (null if not finished) — keys `"1"` through `"4"` |
+| `current_nv` | int | NV of the candidate solution in the current step |
+| `best_nv` | int | Best NV found so far across all episode steps |
+| `current_td` | float | TD of candidate in the current step |
 | `best_td` | float | Best TD found so far |
 | `current_score` | float | `1000 × current_nv + current_td` |
 | `best_score` | float | Best `1000 × NV + TD` found so far |
-| `iteration` | int | Current HGS iteration count |
-| `max_iterations` | int | Total iteration budget |
+| `iteration` | int | Cumulative HGS iteration count across all episode steps |
+| `max_iterations` | int | Total iteration budget (approx. `episode_step_max × avg_iters_per_step`) |
 | `elapsed_seconds` | int | Wall time since job started |
+| `current_action` | string | **NEW** — Last Fleet Manager action: one of `FREE_SAME`, `FREE_NEW`, `LOCK_SAME`, `LOCK_NEW`, `PUSH_SAME`, `PUSH_NEW`, `FORCE_MIN`. Empty string before first step. |
+| `episode_step` | int | **NEW** — Current RL episode step index (0 = initial solve, 1–50 = agent-driven steps) |
+| `episode_step_max` | int | **NEW** — Fixed upper bound for episode steps (always `50`) |
+| `nv_min` | int | Theoretical minimum fleet = `ceil(total_demand / capacity)` |
 | `log_lines` | array | Last 10 log messages (newest last) |
 
 **Stage names by number:**
 
-| # | Name |
-|---|---|
-| 1 | GNN Observer |
-| 2 | Fleet Manager |
-| 3 | HGS Engine |
-| 4 | Route Driver |
-| 5 | MACA Trainer |
+| # | Name | Model | Notes |
+|---|---|---|---|
+| 1 | Feature Extractor | Hand-crafted (7-dim) | Deterministic; runs in milliseconds |
+| 2 | Fleet Manager | Actor-Critic PPO | Selects action each episode step |
+| 3 | HGS Engine | Hybrid Genetic Search | Runs 500–1500 iters per step × 50 steps |
+| 4 | PPO Trainer | Reward Propagation | Updates Fleet Manager weights after episode |
+
+> **Note:** The old 5-stage schema (`1`–`5`) is **replaced** by this 4-stage schema (`1`–`4`). Stage keys `"5"` no longer exist in the response.
 
 **Error Response `404`**
 ```json
@@ -207,7 +213,7 @@ The `status` field in the `/status` response is not just informational — **it 
 
 ### How to Implement the Status Transition in Python
 
-The key principle: your background thread must update `jobs[job_id]["status"]` to `"complete"` **after** all 5 stages have finished and the result has been stored. Here is the exact pattern:
+The key principle: your background thread must update `jobs[job_id]["status"]` to `"complete"` **after** all 4 stages have finished and the result has been stored. Here is the exact pattern:
 
 ```python
 import threading
@@ -218,141 +224,156 @@ jobs: dict[str, dict] = {}
 def run_solver_background(job_id: str, vrp_file_path: str):
     """
     This runs in a background thread. The main thread returns 202 immediately.
-    This function updates jobs[job_id] as it progresses through all 5 stages.
+    Updates jobs[job_id] as it progresses through the 4-stage pipeline.
     """
     try:
-        # ── Stage 1: GNN Observer ─────────────────────────────────────────
+        # ── Stage 1: Feature Extraction ────────────────────────────────────
         jobs[job_id]["current_stage"] = 1
         jobs[job_id]["stage_statuses"]["1"] = "running"
-        jobs[job_id]["log_lines"].append("[GNN] Starting graph embedding...")
+        jobs[job_id]["log_lines"].append("[FE] Computing 7-dim instance features...")
 
-        # ... your actual GNN code here ...
-        embedding = gnn_encoder.encode(vrp_file_path)
+        from src.solver_engine import _parse_vrp_file, _compute_instance_features
+        hgs_data = _parse_vrp_file(vrp_file_path)
+        instance_features = _compute_instance_features(hgs_data)
 
         jobs[job_id]["stage_statuses"]["1"] = "done"
-        jobs[job_id]["stage_times_seconds"]["1"] = 0.3
-        jobs[job_id]["log_lines"].append("[GNN] Graph embedding complete — 128-dim vector")
+        jobs[job_id]["stage_times_seconds"]["1"] = 0.02   # typically <50ms
+        jobs[job_id]["log_lines"].append(
+            f"[FE] Feature extraction complete — 7-dim vector "
+            f"({hgs_data['num_customers']} customers)"
+        )
 
-        # ── Stage 2: Fleet Manager ────────────────────────────────────────
+        # ── Stage 2 + 3: Fleet Manager + HGS Engine (interleaved per step) ──
+        # The Fleet Manager selects an action each step; HGS executes it.
+        # Both stages run concurrently from the RL agent's perspective.
         jobs[job_id]["current_stage"] = 2
         jobs[job_id]["stage_statuses"]["2"] = "running"
-
-        # ... your Fleet Manager PPO code here ...
-
-        jobs[job_id]["stage_statuses"]["2"] = "done"
-        jobs[job_id]["stage_times_seconds"]["2"] = 1.2
-
-        # ── Stage 3: HGS Engine ───────────────────────────────────────────
-        jobs[job_id]["current_stage"] = 3
         jobs[job_id]["stage_statuses"]["3"] = "running"
 
-        # ... your HGS solve loop here ...
-        # Inside the loop, update metrics so the frontend sees live progress:
-        jobs[job_id]["current_nv"] = info["nv"]
-        jobs[job_id]["best_nv"]    = info["best_nv"]
-        jobs[job_id]["current_td"] = info["td"]
-        jobs[job_id]["best_td"]    = info["best_td"]
-        jobs[job_id]["iteration"]  = info["total_iters"]
-        jobs[job_id]["log_lines"].append(f"[HGS] Iteration {info['total_iters']} / 10000")
-        jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]  # keep last 10
+        from src.solver_engine import CVRPEnv, ACTION_NAMES
+        from src.agent_manager import FleetManager
+        import torch
 
+        env = CVRPEnv(instance_paths=[vrp_file_path], max_steps=50)
+        manager = FleetManager()
+        # Load best trained weights
+        ckpt = torch.load("logs/best_model.pth", map_location="cpu", weights_only=False)
+        manager.load_state_dict(ckpt["manager_state_dict"])
+        manager.eval()
+
+        obs, info = env.reset()
+        done = False
+        total_iters = 0
+
+        while not done:
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+            mask = info.get("action_mask")
+            mask_t = torch.tensor(mask, dtype=torch.bool).unsqueeze(0) if mask is not None else None
+
+            with torch.no_grad():
+                logits, _ = manager(obs_t[:, :7], obs_t[:, 7:], action_mask=mask_t)
+                action = logits.argmax(dim=-1).item()
+
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+
+            step = info["step"]
+            action_name = ACTION_NAMES[action]
+            total_iters += 500 if action < 4 else (1000 if action < 6 else 1500)
+
+            # Write progress so the Flutter app sees it on next poll
+            jobs[job_id]["current_action"] = action_name
+            jobs[job_id]["episode_step"] = step
+            jobs[job_id]["best_nv"] = info["nv"]
+            jobs[job_id]["best_td"] = info["td"]
+            jobs[job_id]["best_score"] = info["score"]
+            jobs[job_id]["iteration"] = total_iters
+            jobs[job_id]["log_lines"].append(
+                f"[FM] Step {step}: action={action_name} → NV={info['nv']} score={info['score']:.0f}"
+            )
+            jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]
+
+        jobs[job_id]["stage_statuses"]["2"] = "done"
         jobs[job_id]["stage_statuses"]["3"] = "done"
+        jobs[job_id]["stage_times_seconds"]["2"] = 0.5
+        jobs[job_id]["stage_times_seconds"]["3"] = elapsed_so_far  # your timer
 
-        # ── Stages 4 & 5: Route Driver + MACA ────────────────────────────
-        # ... repeat the same pattern for stages 4 and 5 ...
-
+        # ── Stage 4: PPO Trainer (marks training update complete) ─────────
+        # During inference/competition mode this stage is a no-op — the
+        # model was already trained offline. Mark it instantly as done.
+        jobs[job_id]["current_stage"] = 4
+        jobs[job_id]["stage_statuses"]["4"] = "running"
+        jobs[job_id]["log_lines"].append("[PPO] Inference mode — policy weights frozen")
+        # (In training mode: run ppo_update() here and save the new checkpoint)
         jobs[job_id]["stage_statuses"]["4"] = "done"
-        jobs[job_id]["stage_statuses"]["5"] = "done"
+        jobs[job_id]["stage_times_seconds"]["4"] = 0.0
 
-        # ── CRITICAL STEP: Store the final result BEFORE marking complete ─
-        # The Flutter app will immediately call GET /result/{job_id}
-        # as soon as it sees "complete". If result is not stored yet,
-        # that call will fail. Always store result first, then set complete.
-        jobs[job_id]["result"] = build_result_payload(job_id, solution, data)
+        # ── Store final result ─────────────────────────────────────────────
+        jobs[job_id]["result"] = {
+            "num_vehicles": info["nv"],
+            "total_distance": info["td"],
+            "score": info["score"],
+            "routes": [],    # fill from env._best_routes if tracked
+        }
 
-        # ── CRITICAL STEP: Mark the job as complete ───────────────────────
-        # This is the line that tells Flutter to stop polling and navigate
-        # to the Solution Viewer. Without this line, the app polls forever.
-        jobs[job_id]["status"] = "complete"                          # ← DO NOT FORGET THIS
+        # ── CRITICAL: flip status to "complete" ───────────────────────────
+        jobs[job_id]["status"] = "complete"
         jobs[job_id]["log_lines"].append("[✓] Solve complete")
 
     except Exception as e:
-        # If anything goes wrong, set "error" so the frontend stops polling
-        # and shows an error state instead of spinning forever.
         jobs[job_id]["status"] = "error"
-        jobs[job_id]["log_lines"].append(f"[ERROR] {str(e)}")
+        jobs[job_id]["log_lines"].append(f"[ERROR] {e}")
+```
 
+### Progress reporting hook (minimal version)
 
-@app.post("/solve")
-async def solve(file: UploadFile, track: str = "cvrp", mode: str = "competition"):
-    job_id = uuid4().hex[:8]
-
-    # Initialise the job dict — status starts as "running"
-    jobs[job_id] = {
-        "status": "running",          # ← starts as running
-        "current_stage": 1,
-        "stage_statuses": {"1": "waiting", "2": "waiting", "3": "waiting", "4": "waiting", "5": "waiting"},
-        "stage_times_seconds": {"1": None, "2": None, "3": None, "4": None, "5": None},
-        "current_nv": 0, "best_nv": 0,
-        "current_td": 0.0, "best_td": 0.0,
-        "current_score": 0.0, "best_score": 0.0,
-        "iteration": 0, "max_iterations": 10000,
-        "elapsed_seconds": 0,
-        "log_lines": [],
-        "result": None,
-    }
-
-    # Save file to disk so the background thread can read it
-    vrp_path = f"/tmp/{job_id}.vrp"
-    with open(vrp_path, "wb") as f:
-        f.write(await file.read())
-
-    # Launch background thread — returns 202 immediately while solve runs
-    thread = threading.Thread(
-        target=run_solver_background,
-        args=(job_id, vrp_path),
-        daemon=True,
+```python
+def on_step(job_id: str, info: dict, action_name: str, total_iters: int):
+    """Call this after every CVRPEnv.step() to keep the Flutter app updated."""
+    jobs[job_id]["current_action"] = action_name
+    jobs[job_id]["episode_step"]   = info["step"]
+    jobs[job_id]["best_nv"]        = info["nv"]
+    jobs[job_id]["best_td"]        = info["td"]
+    jobs[job_id]["best_score"]     = info["score"]
+    jobs[job_id]["iteration"]      = total_iters
+    jobs[job_id]["log_lines"].append(
+        f"[FM] Step {info['step']}: {action_name} → NV={info['nv']} score={info['score']:.0f}"
     )
-    thread.start()
-
-    # Return immediately with the job_id
-    return JSONResponse(status_code=202, content={
-        "job_id": job_id,
-        "instance_name": file.filename.replace(".vrp", ""),
-        # parse num_nodes, vehicle_capacity, total_demand, nv_min from the file
-        ...
-    })
+    jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]  # keep last 10
 ```
 
-### The Complete Status Lifecycle
+### Initial job state (when POST /solve is called)
 
+```python
+job_id = uuid4().hex[:8]
+jobs[job_id] = {
+    "status":              "running",
+    "current_stage":       1,
+    "stage_statuses":      {"1": "waiting", "2": "waiting", "3": "waiting", "4": "waiting"},
+    "stage_times_seconds": {"1": None,      "2": None,      "3": None,      "4": None},
+    "current_nv":          None,
+    "best_nv":             None,
+    "current_td":          None,
+    "best_td":             None,
+    "current_score":       None,
+    "best_score":          None,
+    "iteration":           0,
+    "max_iterations":      25000,   # 50 steps × ~500 avg iters
+    "current_action":      "",
+    "episode_step":        0,
+    "episode_step_max":    50,
+    "nv_min":              nv_min,  # parsed from .vrp at upload time
+    "log_lines":           [],
+    "result":              None,
+    "instance_path":       vrp_file_path,
+    "instance_name":       instance_name,
+    "num_nodes":           num_nodes,
+}
 ```
-POST /solve called
-       │
-       ▼
-jobs[job_id]["status"] = "running"   ← set at job creation
-       │
-       ▼  (background thread works through stages 1→5)
-       │
-       ▼
-jobs[job_id]["result"] = { ... }     ← STORE RESULT FIRST
-       │
-       ▼
-jobs[job_id]["status"] = "complete"  ← THEN mark complete
-       │
-       ▼  (Flutter sees "complete" on next 500ms poll)
-       │
-       ▼
-Flutter stops polling
-Flutter calls GET /result/{job_id}
-Flutter navigates to Solution Viewer ✓
-```
-
-**The order matters:** always store the result object before setting status to `"complete"`. If you set `"complete"` first, the Flutter app will immediately call `GET /result/{job_id}` and find `result: None`.
 
 ---
 
-## Endpoint 4 — Get Final Result
+## Endpoint 4 — Fetch Final Result
 
 ```
 GET /result/{job_id}
@@ -523,11 +544,13 @@ Called once when `/status` returns `"status": "complete"`. Returns the full solu
 
 ---
 
-## Endpoint 5 — List Past Runs
+## Endpoint 5 — Recent Runs
 
 ```
-GET /runs
+GET /runs?limit=N
 ```
+
+Called by the **Dashboard** on load and every 30 seconds. Returns a list of completed and running jobs.
 
 Populates the **Recent Runs** table on the Dashboard screen and the score trend chart.
 
@@ -612,183 +635,7 @@ Called when the user clicks the **Stop** button in the Solver Console. Should gr
 
 ---
 
-## Endpoint 7 — Start a Benchmark Job
-
-```
-POST /benchmark
-Content-Type: multipart/form-data
-```
-
-Runs HGS Default and HGS Large Population on the uploaded instance using
-the same iteration budget as the main solve. The RL result is passed in
-from the client (already computed by /solve) so we don't re-run it.
-
-**Request fields:**
-
-| Field              | Type   | Required | Description                                      |
-|--------------------|--------|----------|--------------------------------------------------|
-| `file`             | file   | Yes      | The .vrp instance file                           |
-| `rl_job_id`        | string | No       | job_id of the completed RL solve                 |
-| `rl_score`         | float  | No       | Best score from the RL solve (1000×NV + TD)      |
-| `rl_nv`            | int    | No       | Best NV from the RL solve                        |
-| `rl_td`            | float  | No       | Best TD from the RL solve                        |
-
-If `rl_score` / `rl_nv` / `rl_td` are provided, include them verbatim in
-the response under the "RouteIQ RL" comparison entry. Otherwise run the
-RL pipeline fresh (same as /solve, competition mode).
-
-**Response `202 Accepted`:**
-```json
-{
-  "benchmark_id": "bm_a3f9c2b1"
-}
-```
-
----
-
-## Endpoint 8 — Poll Benchmark Status / Result
-
-```
-GET /benchmark/{benchmark_id}
-```
-
-Called every second by the Flutter app while the benchmark is running.
-Returns `"complete"` plus the full comparisons array once both baselines finish.
-
-**Response `200` (running):**
-```json
-{
-  "benchmark_id": "bm_a3f9c2b1",
-  "status": "running",
-  "message": "Running HGS Large Population (stage 2/2)..."
-}
-```
-
-**Response `200` (complete):**
-```json
-{
-  "benchmark_id": "bm_a3f9c2b1",
-  "instance_name": "X-n101-k25",
-  "status": "complete",
-  "comparisons": [
-    {
-      "name": "RouteIQ RL",
-      "nv": 26,
-      "td": 28702.7,
-      "score": 54702.7,
-      "solve_time_seconds": 106
-    },
-    {
-      "name": "HGS Default",
-      "nv": 29,
-      "td": 31204.8,
-      "score": 60204.8,
-      "solve_time_seconds": 60
-    },
-    {
-      "name": "HGS Large Pop",
-      "nv": 28,
-      "td": 30100.0,
-      "score": 58100.0,
-      "solve_time_seconds": 120
-    }
-  ]
-}
-```
-
-| Field                        | Type    | Description                                      |
-|------------------------------|---------|--------------------------------------------------|
-| `comparisons[].name`         | string  | "RouteIQ RL", "HGS Default", or "HGS Large Pop" |
-| `comparisons[].nv`           | int     | Vehicles used                                    |
-| `comparisons[].td`           | float   | Total distance                                   |
-| `comparisons[].score`        | float   | 1000 × nv + td                                   |
-| `comparisons[].solve_time_seconds` | int | Wall time for this solver              |
-
-**Convention:** Always return "RouteIQ RL" as the first element so the
-Flutter app can use `comparisons.first` as the RL reference.
-
-**Response `200` (error):**
-```json
-{
-  "benchmark_id": "bm_a3f9c2b1",
-  "status": "error",
-  "message": "HGS solver crashed on stage 2"
-}
-```
-
----
-
-## Summary Table
-
-| # | Method | Endpoint | Used By | When |
-|---|---|---|---|---|
-| 1 | `GET` | `/health` | Sidebar status dot, Topbar API indicator | App startup |
-| 2 | `POST` | `/solve` | Solver Console — Run button | User clicks Run |
-| 3 | `GET` | `/status/{job_id}` | Solver Console — live monitor | Every 500ms while running |
-| 4 | `GET` | `/result/{job_id}` | Solution Viewer screen | Once job completes |
-| 5 | `GET` | `/runs` | Dashboard — recent runs table + chart | Dashboard load |
-| 6 | `POST` | `/stop/{job_id}` | Solver Console — Stop button | User clicks Stop |
-
----
-
-## Implementation Notes for the Backend Dev
-
-### Where each response comes from in the existing code
-
-| API Field | Source in Python Code |
-|---|---|
-| `nv_min` | `CVRPEnv._compute_nv_min()` in `solver_engine.py` |
-| `current_nv` / `best_nv` | `info["nv"]` returned from `CVRPEnv.step()` |
-| `current_td` / `best_td` | `info["td"]` returned from `CVRPEnv.step()` |
-| `score` | `competition_score(nv, td)` = `1000 * nv + td` in `solver_engine.py` |
-| `stage_statuses` | Track manually as you call stages 1→5 sequentially |
-| `routes[].customer_ids` | `solution.routes()` from PyVRP's `Solution` object |
-| `depot` / `customers` coords | `data.location(i).x`, `.y` from PyVRP's `ProblemData` |
-| `log_lines` | Append strings to a list as each stage runs |
-| `iteration` | `res.num_iterations` from `pyvrp.solve()` result |
-
-### Job state storage (simplest approach)
-
-```python
-# In-memory store is fine for a competition demo
-jobs: dict[str, dict] = {}
-
-# When POST /solve is called:
-job_id = uuid4().hex[:8]
-jobs[job_id] = {
-    "status": "running",
-    "current_stage": 1,
-    "best_nv": None,
-    "best_td": None,
-    "log_lines": [],
-    "result": None,
-    ...
-}
-# Launch background thread that updates jobs[job_id] as it runs
-```
-
-### Progress reporting hook
-
-Add a simple callback inside your solve loop so the background thread can write progress without blocking:
-
-```python
-def on_step(info: dict, stage: int, log_msg: str):
-    jobs[job_id]["current_stage"] = stage
-    jobs[job_id]["best_nv"] = info["nv"]
-    jobs[job_id]["best_td"] = info["td"]
-    jobs[job_id]["best_score"] = info["score"]
-    jobs[job_id]["iteration"] = info["total_iters"]
-    jobs[job_id]["log_lines"].append(log_msg)
-    jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]  # keep last 10
-```
-
----
-
-*ML4VRP 2026 — GECCO Competition · API Spec v2.0*
-
----
-
-## Endpoint 7 — Benchmark Comparison ← NEW
+## Endpoint 7 — Benchmark Comparison
 
 ```
 GET /benchmark/{job_id}
@@ -844,7 +691,7 @@ The Flutter app calls this once after `GET /status/{job_id}` returns `"status": 
 | `hgs_large_pop.td` | float | Total distance from large population run |
 | `hgs_large_pop.score` | float | `1000 × hgs_large_pop.nv + hgs_large_pop.td` |
 
-**Response `425 Too Early`** — baselines still computing, Flutter polls again in 2s
+**Response `425 Too Early`** — baselines still computing
 ```json
 { "status": "computing", "job_id": "a3f9c2b1" }
 ```
@@ -856,68 +703,33 @@ The Flutter app calls this once after `GET /status/{job_id}` returns `"status": 
 
 ---
 
-### Implementation Notes for the Backend Dev
+## Log Line Format Reference
 
-**The RL result is free** — you already have it from the completed job:
-```python
-@app.get("/benchmark/{job_id}")
-async def benchmark(job_id: str):
-    job = jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404)
+Log lines in `log_lines` should follow this format so the Flutter console colours them correctly:
 
-    # RL result is already computed — just read it
-    rl_result = job["result"]  # from the completed /solve job
+| Prefix | Stage | Colour in UI |
+|---|---|---|
+| `[FE]` | Feature Extractor | Green |
+| `[FM]` | Fleet Manager | Cyan |
+| `[HGS]` | HGS Engine | Amber |
+| `[PPO]` | PPO Trainer | Purple |
 
-    # Run PyVRP Default (same iteration budget: 20 × 1000 = 20,000)
-    hgs_default = run_pyvrp_baseline(
-        instance_path=job["instance_path"],
-        params=AlgorithmParameters(),         # factory defaults
-        total_iterations=20_000,
-    )
-
-    # Run PyVRP Large Population
-    hgs_large = run_pyvrp_baseline(
-        instance_path=job["instance_path"],
-        params=AlgorithmParameters(min_pop_size=50, generation_size=80),
-        total_iterations=20_000,
-    )
-
-    return {
-        "job_id": job_id,
-        "instance_name": job["instance_name"],
-        "num_nodes": job["num_nodes"],
-        "rl":           { "nv": rl_result["num_vehicles"], "td": rl_result["total_distance"], "score": rl_result["score"] },
-        "hgs_default":  { "nv": hgs_default.best.num_routes(), "td": hgs_default.best.distance(), "score": 1000*hgs_default.best.num_routes() + hgs_default.best.distance() },
-        "hgs_large_pop":{ "nv": hgs_large.best.num_routes(),   "td": hgs_large.best.distance(),   "score": 1000*hgs_large.best.num_routes()   + hgs_large.best.distance() },
-    }
+Example set of log lines for a typical solve step:
+```
+"[FE] Feature extraction complete — 7-dim vector (100 customers)"
+"[FM] Step 1: action=FREE_SAME fleet_target=None iters=500"
+"[HGS] Initial solve: NV=29 TD=31241.8 score=60241.8"
+"[FM] Step 2: action=PUSH_NEW fleet_target=26 seed=new iters=1000"
+"[HGS] New best: NV=26 TD=28702.7 score=54702.7"
+"[FM] Step 17: action=LOCK_SAME fleet_target=26 seed=same iters=500"
+"[PPO] Inference mode — policy weights frozen"
 ```
 
-**How to run the baselines with the same budget:**
-```python
-import pyvrp
-from pyvrp import AlgorithmParameters
-from pyvrp.stop import MaxIterations
-
-def run_pyvrp_baseline(instance_path: str, params: AlgorithmParameters, total_iterations: int):
-    data = pyvrp.read(instance_path, round_func="round")
-    result = pyvrp.solve(
-        data,
-        stop=MaxIterations(total_iterations),
-        params=params,
-        seed=42,       # fixed seed for reproducibility
-        display=False,
-    )
-    return result
-```
-
-**Same iteration budget matters for a fair comparison:**
-The RL agent runs 20 steps × 1,000 iterations = 20,000 ILS iterations total.
-Both PyVRP baselines should use the same 20,000 iteration budget so the comparison is fair.
+> **Removed prefixes:** `[GNN]` is no longer used — the GNN Observer stage does not exist in the current architecture.
 
 ---
 
-## Updated Summary Table
+## Summary Table
 
 | # | Method | Endpoint | Used By | When |
 |---|---|---|---|---|
@@ -931,4 +743,37 @@ Both PyVRP baselines should use the same 20,000 iteration budget so the comparis
 
 ---
 
-*ML4VRP 2026 — GECCO Competition · API Spec v2.0*
+## Implementation Notes for the Backend Dev
+
+### Where each response field comes from in the Python code
+
+| API Field | Source in Python Code |
+|---|---|
+| `nv_min` | `CVRPEnv._compute_nv_min()` in `solver_engine.py` |
+| `current_nv` / `best_nv` | `info["nv"]` returned from `CVRPEnv.step()` |
+| `current_td` / `best_td` | `info["td"]` returned from `CVRPEnv.step()` |
+| `best_score` | `info["score"]` = `competition_score(nv, td)` = `1000 * nv + td` |
+| `current_action` | `ACTION_NAMES[action]` from `solver_engine.py` |
+| `episode_step` | `info["step"]` returned from `CVRPEnv.step()` |
+| `episode_step_max` | `CVRPEnv.max_steps` — always 50 |
+| `iteration` | Cumulative sum of `iters_used` per step (500 / 1000 / 1500) |
+| `max_iterations` | `episode_step_max × avg_iters` ≈ 50 × 500 = 25,000 (approximate) |
+| `stage_statuses` | Track manually as you call stages 1→4 sequentially |
+| `stage_times_seconds` | Wall-clock time between stage start and end |
+| `log_lines` | Append strings to a list as each stage/step runs |
+
+### Action → iteration budget mapping
+
+| Action | `num_vehicles` | `nb_iter` |
+|---|---|---|
+| `FREE_SAME` (0) | `None` (unconstrained) | 500 |
+| `FREE_NEW` (1) | `None` | 500 |
+| `LOCK_SAME` (2) | `best_nv` | 500 |
+| `LOCK_NEW` (3) | `best_nv` | 500 |
+| `PUSH_SAME` (4) | `best_nv − 1` | 1000 |
+| `PUSH_NEW` (5) | `best_nv − 1` | 1000 |
+| `FORCE_MIN` (6) | `nv_min` | 1500 |
+
+---
+
+*ML4VRP 2026 — GECCO Competition · API Spec v3.0 (4-stage architecture)*
