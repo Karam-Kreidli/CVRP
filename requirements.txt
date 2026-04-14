@@ -5,12 +5,20 @@
 # On Ubuntu: sudo apt-get install build-essential
 # On macOS:  xcode-select --install
 #
-# For GPU training (recommended), install the CUDA-enabled PyTorch build:
+# For GPU training (recommended), install the CUDA-enabled PyTorch build first:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 # then install the remaining packages:
 #   pip install -r requirements.txt
 
+# Core solver + RL runtime
 torch>=2.0
 numpy>=1.24
 gymnasium>=0.29
-hygese>=0.0.1
+
+# hygese 0.0.0.x is what is currently published on PyPI.
+hygese>=0.0.0.10
+
+# Backend API runtime (backend.py)
+fastapi>=0.100
+uvicorn>=0.20
+python-multipart>=0.0.6
