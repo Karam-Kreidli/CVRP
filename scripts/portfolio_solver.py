@@ -13,7 +13,7 @@ The portfolio approach works because:
 Usage:
     python scripts/portfolio_solver.py --instance_path data/
     python scripts/portfolio_solver.py --instance_path data/ --nb_iter 10000 --num_seeds 5
-    python scripts/portfolio_solver.py --instance_path data/ --output_dir solutions/
+    python scripts/portfolio_solver.py --instance_path data/ --output_dir solutions/HGS
 """
 
 import argparse
@@ -153,18 +153,27 @@ def solve_one(instance_path: str, config_name: str, config_params: dict,
     }
 
 
-def write_solution(output_dir: pathlib.Path, instance_name: str, routes: list):
-    """Write solution in CVRPLIB format (DIMACS convention)."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    sol_path = output_dir / f"{instance_name}.sol"
-    with open(sol_path, "w") as f:
-        for i, route in enumerate(routes):
-            # For TSPLIB instances with depot at node 1, hygese returns customer
-            # indices as 1..n-1 (depot excluded). This already matches the
-            # CVRPLIB solution convention used by DIMACS.
-            customers = " ".join(str(c) for c in route)
-            f.write(f"Route #{i+1}: {customers}\n")
-    return sol_path
+def write_solution_files(output_root: pathlib.Path, instance_name: str, routes: list) -> tuple[pathlib.Path, pathlib.Path]:
+    """Write both .sol and .txt outputs under output_root/{sol-format,txt-format}."""
+    sol_dir = output_root / "sol-format"
+    txt_dir = output_root / "txt-format"
+    sol_dir.mkdir(parents=True, exist_ok=True)
+    txt_dir.mkdir(parents=True, exist_ok=True)
+
+    # For TSPLIB instances with depot at node 1, hygese returns customer
+    # indices as 1..n-1 (depot excluded). This already matches the
+    # CVRPLIB solution convention used by DIMACS.
+    lines = []
+    for i, route in enumerate(routes):
+        customers = " ".join(str(c) for c in route)
+        lines.append(f"Route #{i+1}: {customers}")
+
+    content = "\n".join(lines) + ("\n" if lines else "")
+    sol_path = sol_dir / f"{instance_name}.sol"
+    txt_path = txt_dir / f"{instance_name}.txt"
+    sol_path.write_text(content)
+    txt_path.write_text(content)
+    return sol_path, txt_path
 
 
 def main():
@@ -175,8 +184,8 @@ def main():
                         help="HGS iterations per solve")
     parser.add_argument("--num_seeds", type=int, default=5,
                         help="Number of random seeds per config")
-    parser.add_argument("--output_dir", type=str, default="solutions",
-                        help="Directory to write solution files")
+    parser.add_argument("--output_dir", type=str, default="solutions/HGS",
+                        help="Root output directory. Files are written to sol-format/ and txt-format/")
     parser.add_argument("--workers", type=int, default=4,
                         help="Number of parallel workers")
     args = parser.parse_args()
@@ -185,7 +194,7 @@ def main():
     instance_paths = sorted(instance_dir.glob("*.vrp"))
     assert len(instance_paths) > 0, f"No .vrp files in {args.instance_path}"
 
-    output_dir = pathlib.Path(args.output_dir)
+    output_root = pathlib.Path(args.output_dir)
     num_configs = len(CONFIGS)
     total_solves = len(instance_paths) * num_configs * args.num_seeds
 
@@ -249,14 +258,15 @@ def main():
             print(f"{name:<25s} {r['nv']:>5d} {r['td']:>10.0f} {r['score']:>10.0f}   {r['config']:<25s} {r['seed']:>5d}")
             total_score += r["score"]
 
-            # Write solution file
-            sol_path = write_solution(output_dir, name, r["routes"])
+            # Write both .sol and .txt outputs
+            write_solution_files(output_root, name, r["routes"])
 
     print("-" * 100)
     avg_score = total_score / len(best_per_instance) if best_per_instance else 0
     print(f"{'AVERAGE':<25s} {'':>5s} {'':>10s} {avg_score:>10.0f}")
     print(f"\nTotal time: {elapsed/60:.1f} minutes")
-    print(f"Solutions written to: {output_dir}/")
+    print(f"SOL files written to: {(output_root / 'sol-format')}/")
+    print(f"TXT files written to: {(output_root / 'txt-format')}/")
 
 
 if __name__ == "__main__":
