@@ -159,9 +159,10 @@ def write_solution(output_dir: pathlib.Path, instance_name: str, routes: list):
     sol_path = output_dir / f"{instance_name}.sol"
     with open(sol_path, "w") as f:
         for i, route in enumerate(routes):
-            # Routes in hygese are 0-indexed customer IDs
-            # CVRPLIB format expects 1-indexed
-            customers = " ".join(str(c + 1) for c in route)
+            # For TSPLIB instances with depot at node 1, hygese returns customer
+            # indices as 1..n-1 (depot excluded). This already matches the
+            # CVRPLIB solution convention used by DIMACS.
+            customers = " ".join(str(c) for c in route)
             f.write(f"Route #{i+1}: {customers}\n")
     return sol_path
 
