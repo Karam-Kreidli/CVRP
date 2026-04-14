@@ -13,7 +13,7 @@ Score = 1000 * NV + TD      (lower is better)
 
 The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance units. Fleet minimization is the dominant factor.
 
-**Dataset:** X-dataset (Uchoa et al., 2014) — 59 instances with 100-1001 customers.
+**Dataset:** X-dataset (Uchoa et al., 2014) — 59 instances with 100-400 customers.
 
 **Solver:** HGS-CVRP via the `hygese` Python package (Hybrid Genetic Search — Vidal et al., 2012). A high-performance C++ genetic algorithm for CVRP, wrapped with a Python interface.
 
