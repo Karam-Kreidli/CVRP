@@ -1,4 +1,3 @@
-# Dear Makhavi, this is tested with existing src files. Test and replace with actual implementations once ready.
 # pip install fastapi uvicorn python-multipart torch torch-geometric numpy gymnasium hygese
 # To run: "python backend.py" or "uvicorn backend:app --port 8080 --reload"
 # On browser: http://localhost:8080/docs for interactive API docs
@@ -43,7 +42,7 @@ IS_MODEL_LOADED = False
 # TODO ACTION REQUIRED HERE POST-TRAINING (Below steps should work, if no major code changes are made to the FleetManager architecture or state dict structure during training. If there are changes, you may need to adjust the loading code accordingly.)
 # Once the model is fully trained and you've saved the best weights to "logs/best_model.pth", uncomment the code block below to load those weights into the Fleet Manager. This will ensure that when you run the app, it uses the trained model for inference instead of random weights. Make sure to test this loading process to confirm that the model is correctly loaded and ready for inference!
 # Note: We use `map_location=device` so the app doesn't crash if it tries to load a GPU-trained model on a machine that only has a CPU.
-'''
+
 # 2. Load the fully trained weights from the logs directory
 MODEL_PATH = "logs/best_model.pth"
 
@@ -63,7 +62,7 @@ if os.path.exists(MODEL_PATH):
         print(f"\n[CRITICAL ERROR] Failed to load model weights: {e}\n")
 else:
     print(f"\n[WARNING] {MODEL_PATH} not found. Running with untrained, random weights!\n")
-'''
+
 
 # Human-readable actions for logging
 ACTION_NAMES = ["FREE_SAME", "FREE_NEW", "LOCK_SAME", "LOCK_NEW", "PUSH_SAME", "PUSH_NEW", "FORCE_MIN"]
@@ -148,8 +147,22 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
         jobs[job_id]["log_lines"].append(f"[SYS] Mode: {jobs[job_id]['mode'].upper()} | Limit: {jobs[job_id]['time_limit_seconds']}s")
         jobs[job_id]["log_lines"].append("[FE] Computing instance features...")
 
-        # env.reset() computes hand-crafted instance features and initial solve
         env = CVRPEnv(instance_paths=[vrp_path], device=device)
+
+        env._backend_best_routes = []
+        env._backend_best_score = float('inf')
+        original_solve_hgs = env._solve_hgs
+
+        def patched_solve_hgs(params, num_vehicles=None):
+            result = original_solve_hgs(params, num_vehicles)
+            if not result.get("failed", False) and result.get("score", float('inf')) < env._backend_best_score:
+                env._backend_best_score = result["score"]
+                env._backend_best_routes = result.get("routes", [])
+            return result
+
+        env._solve_hgs = patched_solve_hgs
+
+        # env.reset() computes hand-crafted instance features and initial solve
         obs, info = env.reset()
         
         jobs[job_id]["stage_statuses"]["1"] = "done"
@@ -172,10 +185,10 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
         jobs[job_id]["stage_statuses"]["3"] = "running"
         
         stage_3_start = time.time()
-        max_steps = 50 
         total_iters = 0
+        done = False
 
-        for step in range(1, max_steps + 1):
+        while not done:
             if jobs[job_id]["status"] == "stopped": return
 
             obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
@@ -189,38 +202,29 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
                 action_logits, _ = fleet_manager(inst_feat, stats, action_mask=mask_tensor)
 
             action = torch.argmax(action_logits).item()
-            obs, reward, done, trunc, info = env.step(action)
+            
+            # Step the environment
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            step = info["step"]
 
-            action_name = ACTION_NAMES[action] if action < len(ACTION_NAMES) else f"ACTION_{action}"
-
-            # Action to Iteration Budget Math
+            # The env already tracks the best score, so we just read it directly!
+            jobs[job_id]["best_nv"] = info["nv"]
+            jobs[job_id]["best_td"] = round(info["td"], 2)
+            jobs[job_id]["best_score"] = round(info["score"], 2)
+            
+            # Calculate these manually because the env doesn't return them
+            action_name = info["action_name"]
             iters_this_step = 500 if action < 4 else (1000 if action < 6 else 1500)
             total_iters += iters_this_step
 
-            # Parse target and seed based on the action spec mapping
-            if action in [0, 1]:
-                target = "None"
-            elif action in [2, 3]:
-                target = str(jobs[job_id]["best_nv"])
-            elif action in [4, 5]:
-                target = str(jobs[job_id]["best_nv"] - 1)
-            elif action == 6:
-                target = str(jobs[job_id]["nv_min"])
-            else:
-                target = "Unknown"
+            if action in [0, 1]: target = "None"
+            elif action in [2, 3]: target = str(jobs[job_id]["best_nv"])
+            elif action in [4, 5]: target = str(jobs[job_id]["best_nv"] - 1)
+            elif action == 6: target = str(jobs[job_id]["nv_min"])
+            else: target = "Unknown"
             
             seed_type = "new" if action in [1, 3, 5, 6] else "same"
-
-            # Check if this step yielded a new overall best
-            current_score = round(info.get("score", 0.0), 2)
-            is_new_best = False
-            
-            # Cleaner best_score check
-            if current_score < jobs[job_id]["best_score"]:
-                jobs[job_id]["best_nv"] = info.get("nv", 0)
-                jobs[job_id]["best_td"] = round(info.get("td", 0.0), 2)
-                jobs[job_id]["best_score"] = current_score
-                is_new_best = True
 
             # Sync live data to dict
             jobs[job_id]["current_action"] = action_name
@@ -228,21 +232,16 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
             jobs[job_id]["iteration"] = total_iters
             jobs[job_id]["current_nv"] = info.get("nv", 0)
             jobs[job_id]["current_td"] = round(info.get("td", 0.0), 2)
-            jobs[job_id]["current_score"] = current_score
+            jobs[job_id]["current_score"] = jobs[job_id]["best_score"]
             
-            # Spec-compliant FM log line
             jobs[job_id]["log_lines"].append(f"[FM] Step {step}: action={action_name} fleet_target={target} seed={seed_type} iters={iters_this_step}")
+            jobs[job_id]["log_lines"].append(f"[HGS] Running step {step} / {env.max_steps} — iteration {total_iters} / {jobs[job_id]['max_iterations']}...")
             
-            # Added HGS 'Running step...' log for UI liveliness
-            jobs[job_id]["log_lines"].append(f"[HGS] Running step {step} / {max_steps} — iteration {total_iters} / {jobs[job_id]['max_iterations']}...")
-            
-            if is_new_best:
+            # Log if the score actually improved
+            if round(info["cand_score"], 2) <= jobs[job_id]["best_score"]:
                 jobs[job_id]["log_lines"].append(f"[HGS] New best: NV={jobs[job_id]['best_nv']} TD={jobs[job_id]['best_td']} score={jobs[job_id]['best_score']}")
 
             jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]
-
-            if done or trunc:
-                break
 
         jobs[job_id]["stage_statuses"]["2"] = "done"
         jobs[job_id]["stage_statuses"]["3"] = "done"
@@ -260,18 +259,27 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
         jobs[job_id]["stage_statuses"]["4"] = "done"
         jobs[job_id]["stage_times_seconds"]["4"] = 0.01
 
-        final_params = hgs.AlgorithmParameters(timeLimit=0.0, nbIter=100)
-        final_result = env._solve_hgs(final_params)
-
         elapsed_sec = int(time.time() - start_time)
-        jobs[job_id]["result"] = format_solution(
-            job_id, instance_name, final_result["routes"], env._hgs_data, elapsed_sec
-        )
+        
+        # Grab the physical routes from our monkey-patch tracker
+        best_routes = getattr(env, '_backend_best_routes', [])
 
+        jobs[job_id]["result"] = format_solution(
+            job_id, instance_name, best_routes, env._hgs_data, elapsed_sec
+        )
+        
+        # Manually lock in the AI's best score to overwrite the formatter's math
+        jobs[job_id]["result"]["num_vehicles"] = jobs[job_id]["best_nv"]
+        jobs[job_id]["result"]["total_distance"] = jobs[job_id]["best_td"]
+        jobs[job_id]["result"]["score"] = jobs[job_id]["best_score"]
+
+        # Insert into dashboard history using the tracked AI variables
         runs_db.insert(0, {
             "job_id": job_id, "instance_name": instance_name,
-            "num_vehicles": final_result["nv"], "total_distance": round(final_result["td"], 2),
-            "score": round(final_result["score"], 2), "solve_time_seconds": elapsed_sec,
+            "num_vehicles": jobs[job_id]["best_nv"], 
+            "total_distance": jobs[job_id]["best_td"],
+            "score": jobs[job_id]["best_score"], 
+            "solve_time_seconds": elapsed_sec,
             "status": "complete",
             "completed_at": datetime.utcnow().isoformat() + "Z"
         })
