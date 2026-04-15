@@ -35,10 +35,10 @@ The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance 
                 |                       |
                 |  Output:              |
                 |    instance_features  |
-                |    (1, 7)             |
+                |    (1, 12)            |
                 +-----------------------+
                             |
-              instance_features (7-dim)
+               instance_features (12-dim)
                             |
                             v
                 +-----------------------+
@@ -48,7 +48,7 @@ The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance 
                 |                       |
                 |  Input: inst_feat     |
                 |       + solver_stats  |
-                |       = (1, 14)       |
+                |       = (1, 19)       |
                 |                       |
                 |  Output: action (0-6) |
                 +-----------------------+
@@ -67,7 +67,8 @@ The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance 
                 |  Output: CVRP solution|
                 +-----------------------+
                             |
-                   reward = pct improvement
+                  reward = pct improvement
+                    vs episode best
                             |
                             v
                 +-----------------------+
@@ -87,21 +88,45 @@ The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance 
 
 **Purpose:** Compute a fixed-size feature vector that captures the spatial and structural properties of a CVRP instance. These features let the RL agent distinguish between different types of instances and adapt its strategy accordingly.
 
-**Features (7-dim vector):**
+**Features (12-dim vector):**
 
 | # | Feature | Formula | What it captures |
 |---|---------|---------|-----------------|
-| 1 | size_norm | num_customers / 400 | Instance scale |
-| 2 | demand_fill_ratio | total_demand / (nv_min * capacity) | How tightly vehicles are packed |
-| 3 | mean_dist_norm | mean_distance / max_distance | Average inter-customer spacing |
-| 4 | std_dist_norm | std_distance / max_distance | Distance variance (clustered vs spread) |
-| 5 | depot_centrality | mean_depot_dist / max_distance | How central the depot is |
-| 6 | demand_cv | std_demand / mean_demand | Demand heterogeneity |
-| 7 | capacity_tightness | max_demand / capacity | How close any single customer is to filling a vehicle |
+| 1 | size_norm | $f_1 = \frac{n}{400}$ | Instance scale proxy so the policy can adapt search aggression by problem size |
+| 2 | demand_fill_ratio | $f_2 = \frac{D}{n_v^{\min} C},\; n_v^{\min}=\left\lceil\frac{D}{C}\right\rceil$ | How tightly total demand fills the minimum feasible fleet (slack vs tight capacity regime) |
+| 3 | mean_dist_norm | $f_3 = \frac{\bar d}{d_{\max}},\; \bar d=\frac{1}{n_s(n_s-1)}\sum_{\substack{i,j\in S \\ i\ne j}} d_{ij}$ | Typical inter-customer spacing, normalized for instance scale |
+| 4 | std_dist_norm | $f_4 = \frac{\sigma_d}{d_{\max}}$ | Spatial heterogeneity (clustered pockets vs uniform spread) |
+| 5 | depot_centrality | $f_5 = \frac{\bar d_0}{d_{\max}},\; \bar d_0=\frac{1}{n}\sum_{i=1}^{n} d_{0i}$ | Whether the depot is central or offset from the customer mass |
+| 6 | demand_cv | $f_6 = \frac{1}{2}\min\!\left(\frac{\sigma_q}{\max(\bar q,\epsilon)},\,2\right)$ | Demand variability after clipping/normalization for stable learning |
+| 7 | capacity_tightness | $f_7 = \frac{q_{\max}}{C}$ | Risk that single-customer loads constrain route flexibility |
+| 8 | demand_minmax_ratio | $f_8 = \frac{q_{\min}}{\max(q_{\max},\epsilon)}$ | Demand imbalance floor-to-peak (low values indicate skewed load distribution) |
+| 9 | top3_demand_share | $f_9 = \frac{\sum_{k=1}^{m} q_{(k)}}{\max(D,\epsilon)},\; m=\min(3,n)$ | Load concentration in a few heavy customers |
+| 10 | depot_distance_cv | $f_{10}=\frac{1}{2}\min\!\left(\frac{\sigma_{d_0}}{\max(\bar d_0,\epsilon)},\,2\right)$ | Radial spread irregularity around the depot |
+| 11 | bbox_aspect_ratio | $f_{11}=\frac{\min(W,H)}{\max(\max(W,H),\epsilon)}$ | Geometric anisotropy (compact/square vs elongated instance footprint) |
+| 12 | radial_outlier_ratio | $f_{12}=\frac{1}{n}\sum_{i=1}^{n}\mathbf{1}\!\left[d_{0i}>Q_3+1.5\,\mathrm{IQR}\right],\; \mathrm{IQR}=Q_3-Q_1$ | Fraction of far radial outliers that may force long detours or singleton-like routes |
+
+**Variable legend:**
+- $n$: number of customers (excluding depot).
+- $C$: vehicle capacity.
+- $q_i$: demand of customer $i$; $q_{\min}$ and $q_{\max}$ are the minimum and maximum customer demands.
+- $q_{(k)}$: $k$-th largest customer demand (descending order).
+- $\bar q$ and $\sigma_q$: mean and standard deviation of customer demands.
+- $D=\sum_{i=1}^{n} q_i$: total customer demand.
+- $S$: customer index set used for pairwise-distance features.
+- $n_s=|S|$: size of the set used for pairwise distances.
+- In code, $n_s=n$ if $n\le 200$; otherwise $n_s=200$ (uniform random subsample).
+- $d_{ij}$: Euclidean distance between customers $i$ and $j$.
+- $d_{0i}$: distance from depot (node $0$) to customer $i$.
+- $\bar d$, $\sigma_d$, and $d_{\max}$: mean, standard deviation, and maximum of pairwise customer distances.
+- $\bar d_0$ and $\sigma_{d_0}$: mean and standard deviation of depot-to-customer distances.
+- $W=x_{\max}-x_{\min}$ and $H=y_{\max}-y_{\min}$: bounding-box width and height.
+- $Q_1$ and $Q_3$: first and third quartiles of $\{d_{0i}\}_{i=1}^{n}$.
+- $\epsilon$: small constant used to avoid division by zero (implemented as $10^{-8}$).
 
 **Key details:**
 - Computed **once per instance** at the start of each episode, then reused for all 50 steps
-- All features are normalized to roughly [0, 1] range
+- Pairwise-distance features use all customers for N <= 200 and a 200-customer subsample for larger instances to bound memory/time
+- Features are scaled to stable ranges (mostly [0, 1]) to avoid destabilizing PPO updates
 - No learned parameters — these are deterministic computations
 
 ---
@@ -110,9 +135,9 @@ The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance 
 
 **Purpose:** The RL agent. Decides the fleet-target strategy at each step — whether to push for fewer vehicles, lock the current fleet size, or try a new random seed.
 
-**Observation (14-dim):**
+**Observation (19-dim):**
 ```
-obs = [ instance_features (7) | solver_stats (7) ]
+obs = [ instance_features (12) | solver_stats (7) ]
 ```
 
 | Solver Stat | Formula | Meaning |
@@ -145,10 +170,10 @@ The key insight: removing one vehicle saves 1000 in score, but forcing fewer veh
 
 **Network:**
 ```
-obs (B, 14)
+obs (B, 19)
      |
      v
-Linear(14 -> 64) + ReLU
+Linear(19 -> 64) + ReLU
      |
      v
 Linear(64 -> 64) + ReLU
@@ -164,7 +189,7 @@ action_logits  state_value
   (B, 7)        (B, 1)
 ```
 
-- **Parameters:** ~5,700
+- **Parameters:** ~5,960
 - Intentionally small — the agent makes strategic decisions, not complex computations
 
 ---
@@ -186,7 +211,7 @@ step(action) x 50 times
   |-> Map action to (fleet_target, seed, iteration_budget)
   |-> Run FRESH solver for 500-1500 iterations
   |-> Track best solution across all steps
-  |-> Compute reward (pct improvement vs previous candidate)
+  |-> Compute reward (pct improvement vs episode best)
   |-> Return (obs, reward, done, info)
   |
   v
@@ -285,13 +310,13 @@ This helps the agent learn basic strategies on easier problems before tackling h
            +---------+---------+
            |                   |
            v                   v
-     Feature Extraction    HGS reads
-     (7 hand-crafted       problem data
-      instance stats)      (distances,
+        Feature Extraction    HGS reads
+        (12 hand-crafted      problem data
+         instance stats)      (distances,
            |                demands,
            v                capacity)
-     instance_features         |
-      (7-dim)                  |
+        instance_features         |
+         (12-dim)                 |
            |                   |
            v                   |
      Fleet Manager             |
@@ -314,7 +339,7 @@ This helps the agent learn basic strategies on easier problems before tackling h
            |
            v
      reward = pct improvement
-     over previous candidate
+         over episode best
            |
            v
      PPO updates Fleet Manager
@@ -372,7 +397,7 @@ When training runs, you'll see output like:
 
 | Component | Parameters | Purpose |
 |---|---|---|
-| Fleet Manager | ~5,700 | Strategy selection |
+| Fleet Manager | ~5,960 | Strategy selection |
 
 The model is intentionally lightweight. The heavy lifting is done by HGS-CVRP's C++ solver — our RL agent just learns to steer it effectively.
 
@@ -407,7 +432,7 @@ Our RL agent learns **when to push for fewer vehicles and when to back off**. Si
 The agent builds understanding from two sources:
 
 **Instance features (hand-crafted):**
-Seven computed features capture the structural properties of each instance — size, demand distribution, spatial layout, depot position, and capacity tightness. Instances with different characteristics produce different feature vectors, allowing the agent to learn instance-specific strategies.
+Twelve computed features capture complementary structure: scale, fleet-fill tightness, pairwise geometry, depot centrality, demand dispersion, demand concentration, footprint shape, and radial outliers. This richer descriptor helps the policy separate instances that may have similar size but very different routing difficulty and fleet-pressure behavior.
 
 **Solver feedback (observation stats):**
 At each step, the agent sees 7 real-time signals from the solver:

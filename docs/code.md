@@ -21,7 +21,7 @@ The system has three main components that work together in a pipeline:
 
 ```
 .vrp Instance  -->  Feature Extraction  -->  Fleet Manager  -->  HGS-CVRP Solver
-                    (7 hand-crafted)         (Stage 2)           (Stage 3)
+            (12 hand-crafted)        (Stage 2)           (Stage 3)
                                                                       |
                                                                       v
                                                               PPO Training Loop
@@ -30,28 +30,34 @@ The system has three main components that work together in a pipeline:
 
 ### Feature Extraction (`solver_engine.py`)
 
-**What it does:** Computes 7 hand-crafted features from a CVRP instance that capture its structural properties. These replace the previous GNN encoder — they are deterministic, require no training, and provide meaningful signal immediately.
+**What it does:** Computes 12 hand-crafted features from a CVRP instance that capture scale, demand structure, and spatial geometry. These replace the previous GNN encoder with deterministic, low-cost signals that are immediately useful to the policy.
 
-**The 7 features:**
-1. **size_norm** = num_customers / 400 — how big the instance is
-2. **demand_fill_ratio** = total_demand / (nv_min * capacity) — how tightly vehicles are packed
-3. **mean_dist_norm** = mean_distance / max_distance — average customer spacing
-4. **std_dist_norm** = std_distance / max_distance — whether customers are clustered or spread out
-5. **depot_centrality** = mean_depot_distance / max_distance — how central the depot is
-6. **demand_cv** = std_demand / mean_demand — demand heterogeneity
-7. **capacity_tightness** = max_demand / capacity — how close any one customer is to filling a vehicle
+| # | Feature | Formula | What it captures |
+|---|---|---|---|
+| 1 | size_norm | num_customers / 400 | Instance size prior |
+| 2 | demand_fill_ratio | total_demand / (nv_min * capacity), nv_min = ceil(total_demand / capacity) | How close the instance is to capacity saturation |
+| 3 | mean_dist_norm | mean(pairwise_customer_distances) / max_pairwise_distance | Typical customer spacing |
+| 4 | std_dist_norm | std(pairwise_customer_distances) / max_pairwise_distance | Spatial variability (clustered vs dispersed) |
+| 5 | depot_centrality | mean(depot_to_customer_distances) / max_pairwise_distance | Depot offset from customer mass |
+| 6 | demand_cv | min((std(customer_demands) / max(mean(customer_demands), eps)), 2.0) / 2.0 | Demand heterogeneity with clipped normalization |
+| 7 | capacity_tightness | max(customer_demands) / capacity | Largest single-stop load pressure |
+| 8 | demand_minmax_ratio | min(customer_demands) / max(max(customer_demands), eps) | Demand imbalance from lightest to heaviest stop |
+| 9 | top3_demand_share | sum(top3_customer_demands) / max(total_demand, eps) | Load concentration in a few heavy customers |
+| 10 | depot_distance_cv | min((std(depot_distances) / max(mean(depot_distances), eps)), 2.0) / 2.0 | Radial spread irregularity |
+| 11 | bbox_aspect_ratio | min(bbox_width, bbox_height) / max(max(bbox_width, bbox_height), eps) | Geometry anisotropy (elongated vs compact footprint) |
+| 12 | radial_outlier_ratio | mean(depot_distances > (Q3 + 1.5 * IQR)), IQR = Q3 - Q1 | Fraction of customers that are radial outliers |
 
-Computed once per instance at episode start, then reused for all 50 steps. No learned parameters.
+Computed once per instance at episode start, then reused for all 50 steps. Pairwise distance features use all customers for N <= 200 and a 200-customer subsample above that threshold.
 
 ---
 
 ### Stage 2 — Fleet Manager (`agent_manager.py`)
 
-**What it does:** The RL agent — the "brain" of the system. At each step, it looks at the 7 instance features + 7 real-time solver statistics and chooses one of 7 fleet-target strategies.
+**What it does:** The RL agent — the "brain" of the system. At each step, it looks at 12 instance features + 7 real-time solver statistics and chooses one of 7 fleet-target strategies.
 
-**Observation (14-dim vector):**
+**Observation (19-dim vector):**
 ```
-obs = [instance_features (7) | solver_stats (7)]
+obs = [instance_features (12) | solver_stats (7)]
 ```
 
 The 7 solver statistics:
@@ -81,7 +87,7 @@ The key insight: removing one vehicle saves 1000 in score, but forcing fewer veh
 
 **Network:** Actor-Critic with shared trunk
 ```
-obs (14) --> Linear(14->64) + ReLU --> Linear(64->64) + ReLU
+obs (19) --> Linear(19->64) + ReLU --> Linear(64->64) + ReLU
                                               |
                               +---------------+---------------+
                               |                               |
@@ -93,7 +99,7 @@ obs (14) --> Linear(14->64) + ReLU --> Linear(64->64) + ReLU
 
 - **Actor** outputs a probability distribution over the 7 actions (the policy)
 - **Critic** outputs a single number estimating "how good is this state?" (the value function)
-- **Parameters:** ~5,700 — intentionally tiny since it makes strategic decisions, not route computations
+- **Parameters:** ~5,960 — intentionally tiny since it makes strategic decisions, not route computations
 
 **Action Masking:** When the fleet is already at the theoretical minimum (NV <= NV_min = ceil(total_demand / capacity)), actions 4, 5, 6 (PUSH_SAME, PUSH_NEW, FORCE_MIN) are blocked by setting their logits to -10,000. After softmax, these become ~0 probability, preventing the agent from attempting impossible fleet reductions.
 
@@ -155,9 +161,9 @@ Reinforcement Learning is a paradigm where an **agent** learns to make decisions
 In our system:
 - **Agent** = Fleet Manager
 - **Environment** = CVRPEnv (HGS-CVRP solver wrapper)
-- **State** = 14-dim observation vector (instance features + solver stats)
+- **State** = 19-dim observation vector (instance features + solver stats)
 - **Action** = One of 7 fleet-target strategies (FREE/LOCK/PUSH/FORCE x SAME/NEW seed)
-- **Reward** = Percentage improvement over previous candidate (or -0.5 / -5.0 penalties)
+- **Reward** = Percentage improvement over episode best (or -0.5 / -5.0 penalties)
 
 ### Policy and Value Functions
 
@@ -338,11 +344,11 @@ This guarantees competition-ready solutions regardless of whether RL training su
 
 | File | Role | Parameters |
 |------|------|-----------|
-| `agent_manager.py` | Fleet Manager — RL agent (Actor-Critic) | ~5,700 |
+| `agent_manager.py` | Fleet Manager — RL agent (Actor-Critic) | ~5,960 |
 | `solver_engine.py` | CVRPEnv — Gymnasium environment wrapping HGS-CVRP | — |
 | `train.py` | PPO training loop, GAE, reward clipping | — |
 | `main.py` | Entry point, smoke tests, CLI | — |
 | `baseline_eval.py` | HGS baseline evaluation (default vs large-pop) | — |
 | `portfolio_solver.py` | Deterministic portfolio baseline (11 configs x N seeds) | — |
 
-**Total trainable parameters: ~5,700.** The model is intentionally lightweight. The heavy lifting is done by HGS-CVRP's C++ solver — our RL agent just learns to steer it effectively.
+**Total trainable parameters: ~5,960.** The model is intentionally lightweight. The heavy lifting is done by HGS-CVRP's C++ solver — our RL agent just learns to steer it effectively.

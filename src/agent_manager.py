@@ -7,16 +7,18 @@ next step: whether to push for fewer vehicles, try a new seed, or refine.
 
 WHAT IT DOES:
   At each of the 50 steps in an episode, the Fleet Manager looks at:
-    1. Instance features (7-dim — size, demand, distance stats, etc.)
+    1. Instance features (12-dim — size, demand, spatial, and radial stats)
     2. Seven real-time statistics from the solver ("how is the search going?")
   And chooses one of 7 strategic actions for the next solve.
 
 OBSERVATION (what the agent sees):
-  14-dim vector = [instance_features (7) | solver_stats (7)]
+  19-dim vector = [instance_features (12) | solver_stats (7)]
 
   Instance features (computed once per episode):
     - size_norm, demand_fill_ratio, mean_dist_norm, std_dist_norm,
-      depot_centrality, demand_cv, capacity_tightness
+      depot_centrality, demand_cv, capacity_tightness,
+      demand_minmax_ratio, top3_demand_share, depot_distance_cv,
+      bbox_aspect_ratio, radial_outlier_ratio
 
   Solver stats (updated each step):
     - time_ratio, nv_ratio, score_ratio, stagnation_ratio,
@@ -39,7 +41,7 @@ ARCHITECTURE: Actor-Critic
   PPO uses both during training — the actor learns better actions, the critic
   learns to evaluate states for computing advantages (see train.py).
 
-Parameters: ~5,700 (intentionally tiny — it's making strategic decisions, not
+Parameters: ~5,960 (intentionally tiny — it's making strategic decisions, not
 computing routes)
 """
 
@@ -49,7 +51,7 @@ from torch.distributions import Categorical
 
 
 # Observation dimensions — must match solver_engine.py
-INSTANCE_FEATURES_DIM = 7  # Hand-crafted instance features
+INSTANCE_FEATURES_DIM = 12  # Hand-crafted instance features
 SOLVER_STATS_DIM = 7       # [time_ratio, nv_ratio, score_ratio, stagnation, nv_gap, last_reward, last_action]
 
 # Total number of discrete strategy choices available to the agent
@@ -75,7 +77,7 @@ class FleetManager(nn.Module):
     lifting; this network just learns to steer it.
 
     Args:
-        embed_dim: Dimension of instance features (7).
+        embed_dim: Dimension of instance features (12).
         stats_dim: Dimension of solver statistics vector (7).
         hidden_dim: Width of hidden layers (64).
         num_actions: Number of discrete strategy choices (7).
@@ -89,14 +91,14 @@ class FleetManager(nn.Module):
         num_actions: int = NUM_FLEET_ACTIONS,
     ):
         super().__init__()
-        input_dim = embed_dim + stats_dim  # 7 + 7 = 14
+        input_dim = embed_dim + stats_dim  # 12 + 7 = 19
 
         # --- Shared Feature Trunk ---
         # Both the actor and critic share these layers. This is efficient and
         # helps the critic's value estimates stay aligned with the actor's policy.
         # Two layers of 64 units with ReLU activation.
         self.shared = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),  # 14 → 64
+            nn.Linear(input_dim, hidden_dim),  # 19 → 64
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), # 64 → 64
             nn.ReLU(),
@@ -134,7 +136,7 @@ class FleetManager(nn.Module):
           essentially zero after softmax.
 
         Args:
-            graph_embedding: (B, 7) hand-crafted instance features.
+            graph_embedding: (B, 12) hand-crafted instance features.
             solver_stats:    (B, 7) real-time solver feedback.
             action_mask:     (B, 7) bool tensor. True = action allowed, False = blocked.
 
@@ -143,13 +145,13 @@ class FleetManager(nn.Module):
             state_value:   (B, 1) estimated future reward from this state.
         """
         # Concatenate instance features + solver feedback into one observation
-        obs = torch.cat([graph_embedding, solver_stats], dim=-1)  # (B, 14)
+        obs = torch.cat([graph_embedding, solver_stats], dim=-1)  # (B, 19)
 
         # Shared feature extraction
         features = self.shared(obs)           # (B, 64)
 
         # Actor: score each possible action
-        action_logits = self.actor(features)  # (B, 6)
+        action_logits = self.actor(features)  # (B, 7)
 
         # Apply action mask: set blocked actions to -10000 so softmax gives ~0 probability
         if action_mask is not None:
@@ -176,7 +178,7 @@ class FleetManager(nn.Module):
         During evaluation, we use forward() + argmax instead (greedy, no randomness).
 
         Args:
-            graph_embedding: (B, 7) hand-crafted instance features.
+            graph_embedding: (B, 12) hand-crafted instance features.
             solver_stats:    (B, 7) solver statistics.
             action_mask:     (B, 7) bool tensor. True = allowed, False = masked.
 

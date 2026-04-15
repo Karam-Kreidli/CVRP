@@ -28,7 +28,7 @@ WHAT THE ACTIONS ACTUALLY DO:
   6 = FORCE_MIN       — Force theoretical minimum NV, new seed, 1500 iters
 
 REWARD:
-  Percentage-based improvement over the previous step's candidate score.
+    Percentage-based improvement over the episode-best score.
   Positive when score improves, small negative (-0.5) when no improvement,
   larger penalty (-5.0) for fleet explosions.
 
@@ -51,9 +51,9 @@ import hygese as hgs
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-INSTANCE_FEATURES_DIM = 7    # Hand-crafted instance features
+INSTANCE_FEATURES_DIM = 12   # Hand-crafted instance features
 STATS_DIM = 7                # Solver stats: time, nv_ratio, score_ratio, stagnation, nv_gap, last_reward, last_action
-OBS_DIM = INSTANCE_FEATURES_DIM + STATS_DIM  # 14 = total observation dimension
+OBS_DIM = INSTANCE_FEATURES_DIM + STATS_DIM  # 19 = total observation dimension
 NUM_ACTIONS = 7              # Number of discrete strategy choices
 MAX_STEPS = 50               # Steps per episode
 TIME_PER_STEP = 0.0          # HGS time limit per step (0 = use nbIter only)
@@ -173,14 +173,19 @@ def _compute_instance_features(data: dict) -> np.ndarray:
     Returns a 1-D numpy array of INSTANCE_FEATURES_DIM floats, all roughly
     in [0, 1] range for stable learning.
 
-    Features:
-      0. size_norm:          num_customers / 400
-      1. demand_fill_ratio:  total_demand / (nv_min * capacity)
-      2. mean_dist_norm:     mean inter-customer distance / max distance
-      3. std_dist_norm:      std of inter-customer distances / max distance
-      4. depot_centrality:   mean depot-to-customer distance / max distance
-      5. demand_cv:          coefficient of variation of demands (std/mean)
-      6. capacity_tightness: max single demand / capacity
+        Features:
+            0.  size_norm:            num_customers / 400
+            1.  demand_fill_ratio:    total_demand / (nv_min * capacity)
+            2.  mean_dist_norm:       mean inter-customer distance / max distance
+            3.  std_dist_norm:        std of inter-customer distances / max distance
+            4.  depot_centrality:     mean depot-to-customer distance / max distance
+            5.  demand_cv:            coefficient of variation of demands (std/mean)
+            6.  capacity_tightness:   max single demand / capacity
+            7.  demand_minmax_ratio:  min demand / max demand
+            8.  top3_demand_share:    sum(top-3 demands) / total demand
+            9.  depot_distance_cv:    std(depot distances) / mean(depot distances)
+            10. bbox_aspect_ratio:    min(bbox width, bbox height) / max(bbox width, bbox height)
+            11. radial_outlier_ratio: fraction of customers beyond Q3 + 1.5 * IQR in depot distances
     """
     x = data["x_coordinates"]
     y = data["y_coordinates"]
@@ -243,6 +248,42 @@ def _compute_instance_features(data: dict) -> np.ndarray:
     max_demand = cust_demands.max() if num_customers > 0 else 0.0
     capacity_tightness = max_demand / capacity if capacity > 0 else 1.0
 
+    # 7. Demand min/max ratio — lower means stronger demand imbalance.
+    min_demand = cust_demands.min() if num_customers > 0 else 0.0
+    demand_minmax_ratio = min_demand / max(max_demand, 1e-8)
+
+    # 8. Top-3 demand share — concentration of total load in a few customers.
+    if num_customers > 0 and total_demand > 0:
+        m = min(3, num_customers)
+        top_m = np.partition(cust_demands, -m)[-m:]
+        top3_demand_share = top_m.sum() / max(total_demand, 1e-8)
+    else:
+        top3_demand_share = 0.0
+
+    # 9. Depot-distance CV — radial imbalance around depot.
+    if len(depot_dists) > 0:
+        depot_distance_cv = depot_dists.std() / max(depot_dists.mean(), 1e-8)
+    else:
+        depot_distance_cv = 0.0
+    depot_distance_cv = min(depot_distance_cv, 2.0) / 2.0
+
+    # 10. Bounding-box aspect ratio — elongated vs compact geometry.
+    if num_customers > 1:
+        bbox_w = float(cx.max() - cx.min())
+        bbox_h = float(cy.max() - cy.min())
+        bbox_aspect_ratio = min(bbox_w, bbox_h) / max(max(bbox_w, bbox_h), 1e-8)
+    else:
+        bbox_aspect_ratio = 1.0
+
+    # 11. Radial outlier ratio — share of customers far from the main radial mass.
+    if len(depot_dists) >= 4:
+        q1, q3 = np.percentile(depot_dists, [25, 75])
+        iqr = max(q3 - q1, 0.0)
+        outlier_threshold = q3 + 1.5 * iqr
+        radial_outlier_ratio = float(np.mean(depot_dists > outlier_threshold))
+    else:
+        radial_outlier_ratio = 0.0
+
     return np.array([
         size_norm,
         demand_fill_ratio,
@@ -251,6 +292,11 @@ def _compute_instance_features(data: dict) -> np.ndarray:
         depot_centrality,
         demand_cv,
         capacity_tightness,
+        demand_minmax_ratio,
+        top3_demand_share,
+        depot_distance_cv,
+        bbox_aspect_ratio,
+        radial_outlier_ratio,
     ], dtype=np.float32)
 
 
@@ -319,7 +365,7 @@ class CVRPEnv(gym.Env):
         self._instance_features: np.ndarray | None = None  # Hand-crafted features
         self._nv_initial: int = 0                    # Fleet size after initial solve
         self._nv_min: int = 1                        # Theoretical minimum fleet
-        self._prev_cand_score: float = 0.0           # Previous step's candidate score
+        self._prev_cand_score: float = 0.0           # Last candidate score (debug/info tracking)
         self._step_count: int = 0
         self._iters_since_improvement: int = 0       # Stagnation counter
         self._seed: int = 0
@@ -497,7 +543,7 @@ class CVRPEnv(gym.Env):
           - Iteration budget: 500 / 1000 / 1500 (tighter fleet = more compute)
 
         Reward design:
-          - Compare against PREVIOUS step's candidate (not episode-best)
+                    - Compare against EPISODE BEST score (not previous candidate)
           - Percentage-based improvement for instance-size normalization
           - Small negative (-0.5) for no improvement (cost of compute)
           - Larger penalty (-5.0) for fleet explosions (NV spike > 2)
@@ -575,10 +621,12 @@ class CVRPEnv(gym.Env):
     def _build_observation(self) -> np.ndarray:
         """Construct the observation vector.
 
-        instance_features (7) + solver_stats (7):
+                instance_features (12) + solver_stats (7):
           Instance features (computed once per episode):
             - size_norm, demand_fill_ratio, mean_dist_norm, std_dist_norm,
-              depot_centrality, demand_cv, capacity_tightness
+                            depot_centrality, demand_cv, capacity_tightness,
+                            demand_minmax_ratio, top3_demand_share, depot_distance_cv,
+                            bbox_aspect_ratio, radial_outlier_ratio
 
           Solver stats (updated each step):
             - time_ratio: step progress through episode
