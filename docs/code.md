@@ -344,7 +344,24 @@ This guarantees competition-ready solutions regardless of whether RL training su
 
 ---
 
-## 10. File Map
+## 10. Competition-Oriented Inference Reporting (`scripts/infer.py`)
+
+`scripts/infer.py` now supports a competition-facing evaluation mode when `--baseline` is enabled:
+
+- Per-instance RL vs baseline rows with tie-aware outcomes (`win/loss/tie`) at **3-decimal score precision**.
+- Pairwise Formula-1 surrogate points per instance: **10** for winner, **8** for second, tie -> **9/9** split.
+- Aggregate summaries: win/loss/tie counts and rates, absolute/relative deltas, and point totals/margins.
+- Hidden-subset robustness simulation via bootstrap sampling (`--subset_size`, `--bootstrap_trials`, `--bootstrap_seed`).
+- Artifact export to `logs/` by default:
+    - `<stem>_instances.csv`
+    - `<stem>_summary.json`
+    - `<stem>_report.md`
+
+Important interpretation note: this points view is a **pairwise RL-vs-baseline surrogate**, not the final multi-competitor competition ranking.
+
+---
+
+## 11. File Map
 
 | File | Role | Parameters |
 |------|------|-----------|
@@ -352,6 +369,7 @@ This guarantees competition-ready solutions regardless of whether RL training su
 | `solver_engine.py` | CVRPEnv — Gymnasium environment wrapping HGS-CVRP | — |
 | `train.py` | PPO training loop, GAE, reward clipping | — |
 | `main.py` | Entry point, smoke tests, CLI | — |
+| `infer.py` | RL inference + baseline comparison + competition-oriented reports | — |
 | `baseline_eval.py` | HGS baseline evaluation (default vs large-pop) | — |
 | `portfolio_solver.py` | Deterministic portfolio baseline (11 configs x N seeds) | — |
 

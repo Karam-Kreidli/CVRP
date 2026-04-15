@@ -365,6 +365,7 @@ src/
 
 scripts/
   setup_vm.sh        - Ubuntu GPU VM setup script
+  infer.py           - RL inference + baseline comparison + competition-style report export
   baseline_eval.py   - HGS baseline evaluation (default vs large-pop)
   portfolio_solver.py - Deterministic portfolio baseline (11 configs x N seeds)
 
@@ -377,6 +378,8 @@ data/                - X-dataset .vrp instance files
 logs/                - Training CSV metrics + best model
 checkpoints/         - Periodic checkpoint .pth files
 ```
+
+`scripts/infer.py` provides the competition-facing evaluation path. With `--baseline`, it now writes structured artifacts in `logs/` (CSV/JSON/Markdown), applies tie handling at 3-decimal score precision, computes pairwise Formula-1 surrogate points (10/8, tie -> 9/9), and reports bootstrap subset robustness. This is intentionally a **head-to-head RL-vs-baseline surrogate**, not a full hidden-leaderboard rank reconstruction.
 
 ---
 
