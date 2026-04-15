@@ -1,0 +1,2 @@
+instance,rl_nv,rl_td,rl_score,bl_nv,bl_td,bl_score,delta,delta_pct,outcome,rl_points,bl_points,rl_score_rounded,bl_score_rounded,tie_decimals,baseline_seed,baseline_source,elapsed_sec
+X-n101-k25,26,27591.0,53591.0,26,27591.0,53591.0,0.0,0.0,tie,9.0,9.0,53591.0,53591.0,3,42,solve,25.201452255249023

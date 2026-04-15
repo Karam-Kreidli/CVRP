@@ -387,6 +387,7 @@ class CVRPEnv(gym.Env):
         self._best_score: float = float("inf")       # Best score found this episode
         self._instance_features: np.ndarray | None = None  # Hand-crafted features
         self._nv_initial: int = 0                    # Fleet size after initial solve
+        self._initial_score: float = float("inf")   # Score after initial solve
         self._nv_min: int = 1                        # Theoretical minimum fleet
         self._prev_cand_score: float = 0.0           # Last candidate score (debug/info tracking)
         self._step_count: int = 0
@@ -541,6 +542,7 @@ class CVRPEnv(gym.Env):
         self._best_score = result["score"]
         self._best_routes = [list(route) for route in result.get("routes", [])]
         self._nv_initial = result["nv"]
+        self._initial_score = result["score"]
         self._prev_cand_score = result["score"]
         self._step_count = 0
         self._iters_since_improvement = 0
@@ -670,8 +672,7 @@ class CVRPEnv(gym.Env):
 
         nv_ratio = self._best_nv / max(self._nv_initial, 1)
 
-        initial_score = competition_score(self._nv_initial, self._best_td)
-        score_ratio = self._best_score / max(initial_score, 1.0)
+        score_ratio = self._best_score / max(self._initial_score, 1.0)
 
         # Approximate total budget (using average per-step iters for normalization)
         avg_iters = (ITERS_FREE + ITERS_PUSH + ITERS_FORCE) / 3.0

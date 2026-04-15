@@ -149,7 +149,7 @@ The web app calls this **every 500ms** while a job is running to update the live
   "episode_step_max": 50,
   "nv_min": 25,
   "log_lines": [
-    "[00:00.022] [FE] Feature extraction complete — 7-dim vector (100 customers)",
+    "[00:00.022] [FE] Feature extraction complete — 12-dim vector (100 customers)",
     "[00:00.412] [FM] Step 16: action=LOCK_SAME fleet_target=26 seed=same iters=500",
     "[00:00.838] [HGS] New best: NV=26 TD=28702.7 score=54702.7",
     "[00:01.108] [FM] Step 17: action=PUSH_NEW fleet_target=25 seed=new iters=1000",
@@ -174,7 +174,7 @@ The web app calls this **every 500ms** while a job is running to update the live
 | `iteration` | int | Cumulative HGS iteration count across all episode steps |
 | `max_iterations` | int | Total iteration budget (approx. `episode_step_max × avg_iters_per_step`) |
 | `elapsed_seconds` | int | Wall time since job started |
-| `current_action` | string | **NEW** — Last Fleet Manager action: one of `FREE_SAME`, `FREE_NEW`, `LOCK_SAME`, `LOCK_NEW`, `PUSH_SAME`, `PUSH_NEW`, `FORCE_MIN`. Empty string before first step. |
+| `current_action` | string | **NEW** — Last Fleet Manager action: one of `FREE_SAME`, `FREE_NEW`, `LOCK_SAME`, `LOCK_NEW`, `PUSH_SAME`, `PUSH_NEW`, `FORCE_MIN`, `FREE_DIVERSE_NEW`, `LOCK_AGGR_NEW`, `PUSH_BALANCED_NEW`. Empty string before first step. |
 | `episode_step` | int | **NEW** — Current RL episode step index (0 = initial solve, 1–50 = agent-driven steps) |
 | `episode_step_max` | int | **NEW** — Fixed upper bound for episode steps (always `50`) |
 | `nv_min` | int | Theoretical minimum fleet = `ceil(total_demand / capacity)` |
@@ -184,7 +184,7 @@ The web app calls this **every 500ms** while a job is running to update the live
 
 | # | Name | Model | Notes |
 |---|---|---|---|
-| 1 | Feature Extractor | Hand-crafted (7-dim) | Deterministic; runs in milliseconds |
+| 1 | Feature Extractor | Hand-crafted (12-dim) | Deterministic; runs in milliseconds |
 | 2 | Fleet Manager | Actor-Critic PPO | Selects action each episode step |
 | 3 | HGS Engine | Hybrid Genetic Search | Runs 500–1500 iters per step × 50 steps |
 | 4 | PPO Trainer | Reward Propagation | Updates Fleet Manager weights after episode |
@@ -230,7 +230,7 @@ def run_solver_background(job_id: str, vrp_file_path: str):
         # ── Stage 1: Feature Extraction ────────────────────────────────────
         jobs[job_id]["current_stage"] = 1
         jobs[job_id]["stage_statuses"]["1"] = "running"
-        jobs[job_id]["log_lines"].append("[FE] Computing 7-dim instance features...")
+        jobs[job_id]["log_lines"].append("[FE] Computing 12-dim instance features...")
 
         from src.solver_engine import _parse_vrp_file, _compute_instance_features
         hgs_data = _parse_vrp_file(vrp_file_path)
@@ -239,7 +239,7 @@ def run_solver_background(job_id: str, vrp_file_path: str):
         jobs[job_id]["stage_statuses"]["1"] = "done"
         jobs[job_id]["stage_times_seconds"]["1"] = 0.02   # typically <50ms
         jobs[job_id]["log_lines"].append(
-            f"[FE] Feature extraction complete — 7-dim vector "
+            f"[FE] Feature extraction complete — 12-dim vector "
             f"({hgs_data['num_customers']} customers)"
         )
 
@@ -271,7 +271,7 @@ def run_solver_background(job_id: str, vrp_file_path: str):
             mask_t = torch.tensor(mask, dtype=torch.bool).unsqueeze(0) if mask is not None else None
 
             with torch.no_grad():
-                logits, _ = manager(obs_t[:, :7], obs_t[:, 7:], action_mask=mask_t)
+                logits, _ = manager(obs_t[:, :12], obs_t[:, 12:], action_mask=mask_t)
                 action = logits.argmax(dim=-1).item()
 
             obs, reward, terminated, truncated, info = env.step(action)
@@ -716,7 +716,7 @@ Log lines in `log_lines` should follow this format so the Flutter console colour
 
 Example set of log lines for a typical solve step:
 ```
-"[FE] Feature extraction complete — 7-dim vector (100 customers)"
+"[FE] Feature extraction complete — 12-dim vector (100 customers)"
 "[FM] Step 1: action=FREE_SAME fleet_target=None iters=500"
 "[HGS] Initial solve: NV=29 TD=31241.8 score=60241.8"
 "[FM] Step 2: action=PUSH_NEW fleet_target=26 seed=new iters=1000"

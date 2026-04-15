@@ -146,19 +146,6 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
 
         env = CVRPEnv(instance_paths=[vrp_path], device=device)
 
-        env._backend_best_routes = []
-        env._backend_best_score = float('inf')
-        original_solve_hgs = env._solve_hgs
-
-        def patched_solve_hgs(params, num_vehicles=None):
-            result = original_solve_hgs(params, num_vehicles)
-            if not result.get("failed", False) and result.get("score", float('inf')) < env._backend_best_score:
-                env._backend_best_score = result["score"]
-                env._backend_best_routes = result.get("routes", [])
-            return result
-
-        env._solve_hgs = patched_solve_hgs
-
         # env.reset() computes hand-crafted instance features and initial solve
         obs, info = env.reset()
         
@@ -200,6 +187,8 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
 
             action = torch.argmax(action_logits).item()
             
+            prev_best_score = jobs[job_id]["best_score"]
+
             # Step the environment
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
@@ -251,8 +240,8 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
             jobs[job_id]["log_lines"].append(f"[FM] Step {step}: action={action_name} fleet_target={target} seed={seed_type} iters={iters_this_step}")
             jobs[job_id]["log_lines"].append(f"[HGS] Running step {step} / {env.max_steps} — iteration {total_iters} / {jobs[job_id]['max_iterations']}...")
             
-            # Log if the score actually improved
-            if round(info["cand_score"], 2) <= jobs[job_id]["best_score"]:
+            # Log only true best-score improvements.
+            if jobs[job_id]["best_score"] < prev_best_score:
                 jobs[job_id]["log_lines"].append(f"[HGS] New best: NV={jobs[job_id]['best_nv']} TD={jobs[job_id]['best_td']} score={jobs[job_id]['best_score']}")
 
             jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]
@@ -275,8 +264,8 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
 
         elapsed_sec = int(time.time() - start_time)
         
-        # Grab the physical routes from our monkey-patch tracker
-        best_routes = getattr(env, '_backend_best_routes', [])
+        # Pull the route set that corresponds to env's tracked best score.
+        best_routes = env.get_best_routes()
 
         jobs[job_id]["result"] = format_solution(
             job_id, instance_name, best_routes, env._hgs_data, elapsed_sec

@@ -486,7 +486,7 @@ class MARLTrainer:
                 obs_t = torch.tensor(
                     obs, dtype=torch.float32, device=self.device
                 ).unsqueeze(0)                          # (1, OBS_DIM)
-                graph_emb = obs_t[:, :INSTANCE_FEATURES_DIM]              # Instance features (7)
+                graph_emb = obs_t[:, :INSTANCE_FEATURES_DIM]              # Instance features (12)
                 solver_stats = obs_t[:, INSTANCE_FEATURES_DIM:]           # Solver stats (7)
 
                 # Build action mask tensor for the Fleet Manager
