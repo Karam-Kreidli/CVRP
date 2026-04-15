@@ -137,6 +137,7 @@ def solve_instance(
         "td": float(info["td"]),
         "score": float(info["score"]),
         "nv_min": int(info["nv_min"]),
+        "routes": env.get_best_routes(),
         "actions_taken": action_log,
         "action_counts": action_counts,
         "elapsed_sec": float(elapsed),
@@ -566,6 +567,30 @@ def write_summary_json(path: pathlib.Path, payload: dict) -> None:
         json.dump(payload, handle, indent=2)
 
 
+def write_solution_files(
+    output_root: pathlib.Path,
+    instance_name: str,
+    routes: list,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Write RL routes to both .sol and .txt formats."""
+    sol_dir = output_root / "sol-format"
+    txt_dir = output_root / "txt-format"
+    sol_dir.mkdir(parents=True, exist_ok=True)
+    txt_dir.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = []
+    for i, route in enumerate(routes):
+        customers = " ".join(str(customer) for customer in route)
+        lines.append(f"Route #{i + 1}: {customers}")
+
+    content = "\n".join(lines) + ("\n" if lines else "")
+    sol_path = sol_dir / f"{instance_name}.sol"
+    txt_path = txt_dir / f"{instance_name}.txt"
+    sol_path.write_text(content, encoding="utf-8")
+    txt_path.write_text(content, encoding="utf-8")
+    return sol_path, txt_path
+
+
 def _fmt_pct(value: float | None) -> str:
     if value is None:
         return "n/a"
@@ -825,6 +850,19 @@ def main() -> None:
         help="Skip bootstrap subset robustness simulation.",
     )
 
+    # --- RL solution file export ---
+    parser.add_argument(
+        "--solution_output_dir",
+        type=str,
+        default="solutions/HGS+RL",
+        help="Root directory for RL solution files (sol-format/ and txt-format).",
+    )
+    parser.add_argument(
+        "--no_solution_files",
+        action="store_true",
+        help="Disable writing RL .sol and .txt solution files.",
+    )
+
     # --- Verbosity ---
     parser.add_argument(
         "--verbose",
@@ -877,6 +915,9 @@ def main() -> None:
 
     print(f"Running on {len(instance_paths)} instance(s)...\n")
 
+    solution_output_root = pathlib.Path(args.solution_output_dir)
+    solution_files_written = 0
+
     # --- Optional baseline cache ---
     baseline_cache_path = pathlib.Path(args.baseline_cache_csv)
     baseline_cache_enabled = args.baseline and (not args.no_baseline_cache)
@@ -927,6 +968,14 @@ def main() -> None:
             seed=args.seed,
             verbose=args.verbose,
         )
+
+        if not args.no_solution_files:
+            write_solution_files(
+                output_root=solution_output_root,
+                instance_name=rl_result["instance"],
+                routes=rl_result["routes"],
+            )
+            solution_files_written += 1
 
         rl_scores.append(float(rl_result["score"]))
         elapsed_str = f"{rl_result['elapsed_sec']:.1f}s"
@@ -1098,6 +1147,13 @@ def main() -> None:
             print(f"  - {instances_csv}")
             print(f"  - {summary_json}")
             print(f"  - {report_md}")
+
+        if not args.no_solution_files:
+            print(
+                "RL solution files written: "
+                f"{solution_files_written} instance(s) -> "
+                f"{solution_output_root / 'sol-format'} and {solution_output_root / 'txt-format'}"
+            )
     else:
         avg_rl = np.mean(rl_scores)
         print(
@@ -1105,6 +1161,13 @@ def main() -> None:
             f"{'':>5s} {'':>10s} {avg_rl:>10.0f}  "
             f"{'':>6s}  {tm}m{ts:02d}s total"
         )
+
+        if not args.no_solution_files:
+            print(
+                "RL solution files written: "
+                f"{solution_files_written} instance(s) -> "
+                f"{solution_output_root / 'sol-format'} and {solution_output_root / 'txt-format'}"
+            )
 
 
 if __name__ == "__main__":

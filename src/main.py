@@ -386,6 +386,19 @@ def train(args):
     assert len(instance_paths) > 0, f"No .vrp files found at {args.instance_path}"
     print(f"Instances: {len(instance_paths)}")
 
+    if args.reward_clip_min >= args.reward_clip_max:
+        raise ValueError(
+            f"Invalid reward clip range: min={args.reward_clip_min} must be < max={args.reward_clip_max}"
+        )
+    if args.eval_count < 0:
+        raise ValueError(f"Invalid --eval_count={args.eval_count}. It must be >= 0.")
+    if args.holdout_count < 0:
+        raise ValueError(f"Invalid --holdout_count={args.holdout_count}. It must be >= 0.")
+    if args.holdout_eval_interval <= 0:
+        raise ValueError(
+            f"Invalid --holdout_eval_interval={args.holdout_eval_interval}. It must be >= 1."
+        )
+
     # --- Create Environment ---
     # CVRPEnv wraps HGS-CVRP and implements the Gymnasium interface.
     # Hand-crafted instance features replace the untrained GNN encoder.
@@ -395,35 +408,112 @@ def train(args):
         instance_paths=[str(p) for p in instance_paths],
         device=device,
         max_nodes=100 if args.curriculum_epochs > 0 else None,
+        failure_penalty=args.failure_penalty,
+        no_improvement_penalty=args.no_improvement_penalty,
     )
     if args.curriculum_epochs > 0:
         print(f"Curriculum: N<=100 for first {args.curriculum_epochs} epochs, then all")
 
     # --- Select Fixed Evaluation Instances ---
-    # Pick 5 evenly-spaced instances from the sorted dataset for consistent
-    # progress tracking. These same 5 instances are used every epoch.
+    # Pick N evenly-spaced instances from a sorted pool for consistent progress
+    # tracking. The same fixed set is used every epoch.
     eval_instances = []
-    if args.eval_instances:
-        eval_instances = [str(p) for p in pathlib.Path(args.eval_instances).glob("*.vrp")]
-    elif len(instance_paths) >= 5:
-        sorted_paths = sorted(instance_paths, key=lambda p: p.stem)
-        step = max(1, len(sorted_paths) // 5)
-        eval_instances = [str(sorted_paths[i]) for i in range(0, len(sorted_paths), step)][:5]
+    if args.eval_count > 0:
+        eval_pool = []
+        if args.eval_instances:
+            eval_path = pathlib.Path(args.eval_instances)
+            if eval_path.is_file():
+                eval_pool = [eval_path]
+            else:
+                eval_pool = sorted(eval_path.glob("*.vrp"), key=lambda p: p.stem)
+        else:
+            eval_pool = sorted(instance_paths, key=lambda p: p.stem)
+
+        if eval_pool:
+            step = max(1, len(eval_pool) // args.eval_count)
+            eval_instances = [str(eval_pool[i]) for i in range(0, len(eval_pool), step)][:args.eval_count]
+
     if eval_instances:
-        print(f"Eval set: {len(eval_instances)} fixed instances")
+        preview = ", ".join(pathlib.Path(p).stem for p in eval_instances[:5])
+        print(f"Eval set: {len(eval_instances)} fixed instances (preview: {preview})")
+    else:
+        print("Eval set: disabled (eval_count=0)")
+
+    # --- Select Holdout Evaluation Instances ---
+    # Holdout split is non-overlapping with fixed eval set.
+    holdout_instances = []
+    if args.holdout_count > 0:
+        holdout_pool = []
+        if args.holdout_instances:
+            holdout_path = pathlib.Path(args.holdout_instances)
+            if holdout_path.is_file():
+                holdout_pool = [holdout_path]
+            else:
+                holdout_pool = sorted(holdout_path.glob("*.vrp"), key=lambda p: p.stem)
+        else:
+            holdout_pool = sorted(instance_paths, key=lambda p: p.stem)
+
+        eval_set = {pathlib.Path(p).resolve() for p in eval_instances}
+        holdout_pool = [p for p in holdout_pool if p.resolve() not in eval_set]
+
+        if holdout_pool:
+            step = max(1, len(holdout_pool) // args.holdout_count)
+            holdout_instances = [
+                str(holdout_pool[i]) for i in range(0, len(holdout_pool), step)
+            ][:args.holdout_count]
+
+    if holdout_instances:
+        preview = ", ".join(pathlib.Path(p).stem for p in holdout_instances[:5])
+        print(
+            f"Holdout set: {len(holdout_instances)} instances "
+            f"(interval={args.holdout_eval_interval}, preview: {preview})"
+        )
+    elif args.holdout_count > 0:
+        raise ValueError(
+            "Holdout split requested but no holdout instances were selected. "
+            "Check --holdout_instances path or reduce --holdout_count."
+        )
+
+    if args.best_model_metric in ("holdout", "composite") and not holdout_instances:
+        raise ValueError(
+            f"--best_model_metric={args.best_model_metric} requires a non-empty holdout set. "
+            "Set --holdout_count > 0 (and optionally --holdout_instances)."
+        )
 
     config = PPOConfig(
+        gamma=args.gamma,
+        lam=args.lam,
+        epsilon_clip=args.epsilon_clip,
+        vf_coeff=args.vf_coeff,
         manager_lr=args.manager_lr,
+        ppo_epochs=args.ppo_epochs,
         mini_batch_size=args.batch_size,
+        max_grad_norm=args.max_grad_norm,
         use_fp16=args.fp16,
         ent_coeff=args.ent_coeff,
+        target_kl=None if args.target_kl <= 0 else args.target_kl,
+        reward_clip_min=args.reward_clip_min,
+        reward_clip_max=args.reward_clip_max,
     )
+
+    run_config = {
+        "run_tag": args.run_tag,
+        "cli_args": vars(args),
+        "selected_eval_instances": eval_instances,
+        "selected_holdout_instances": holdout_instances,
+        "holdout_eval_interval": args.holdout_eval_interval,
+        "best_model_metric": args.best_model_metric,
+    }
 
     trainer = MARLTrainer(
         env=env, config=config, device=device,
         log_dir=args.log_dir, gdrive_path=args.gdrive_path,
         total_epochs=args.epochs,
         eval_instances=eval_instances,
+        holdout_instances=holdout_instances,
+        holdout_eval_interval=args.holdout_eval_interval,
+        best_model_metric=args.best_model_metric,
+        run_config=run_config,
     )
 
     checkpoint_dir = pathlib.Path(args.checkpoint_dir)
@@ -449,7 +539,7 @@ def train(args):
 
     # --- Main Training Loop ---
     epoch_times = []
-    best_eval_so_far = float("inf")
+    best_tracking_so_far = float("inf")
     epochs_since_improvement = 0
     train_start = time.time()
 
@@ -462,7 +552,10 @@ def train(args):
             curriculum_expanded = True
             print(f"  [Epoch {epoch}] Curriculum expanded: now using all instances")
 
-        stats = trainer.train_epoch(num_episodes=args.episodes_per_epoch)
+        stats = trainer.train_epoch(
+            num_episodes=args.episodes_per_epoch,
+            epoch_index=epoch,
+        )
 
         # --- Timing ---
         epoch_elapsed = time.time() - epoch_t0
@@ -474,19 +567,33 @@ def train(args):
         eta_m = eta_rem // 60
         ep_m, ep_s = divmod(int(epoch_elapsed), 60)
 
-        # --- Best eval tracking ---
+        # --- Best tracking metric summary ---
         eval_str = ""
+        holdout_str = ""
+        tracking_str = ""
         is_new_best = False
         if "eval_score" in stats:
-            eval_score = stats["eval_score"]
-            if eval_score < best_eval_so_far:
-                best_eval_so_far = eval_score
+            eval_str = f" | Eval: {stats['eval_score']:>8.0f}"
+        if "holdout_eval_score" in stats:
+            holdout_str = f" | Holdout: {stats['holdout_eval_score']:>8.0f}"
+
+        tracking_val_raw = stats.get("tracking_score", "")
+        selection_metric = stats.get("selection_metric", "tracking")
+        if tracking_val_raw != "":
+            tracking_val = float(tracking_val_raw)
+            if tracking_val < best_tracking_so_far:
+                best_tracking_so_far = tracking_val
                 epochs_since_improvement = 0
                 is_new_best = True
             else:
                 epochs_since_improvement += 1
+
             best_tag = " *BEST*" if is_new_best else ""
-            eval_str = f" | Eval: {eval_score:>8.0f}{best_tag}"
+            tracking_str = (
+                f" | Sel[{selection_metric}]: {tracking_val:>8.0f}{best_tag}"
+            )
+        else:
+            tracking_str = f" | Sel[{selection_metric}]: {'n/a':>8s}"
 
         total_elapsed = time.time() - train_start
         te_h, te_rem = divmod(int(total_elapsed), 3600)
@@ -494,7 +601,7 @@ def train(args):
 
         print(
             f"[{epoch:>4d}/{args.epochs}] "
-            f"AvgScore: {stats['avg_score']:>8.0f}{eval_str} | "
+            f"AvgScore: {stats['avg_score']:>8.0f}{eval_str}{holdout_str}{tracking_str} | "
             f"Ent: {stats['entropy']:.3f} | "
             f"{ep_m}m{ep_s:02d}s/epoch | "
             f"ETA: {eta_h}h{eta_m:02d}m | "
@@ -502,10 +609,10 @@ def train(args):
         )
 
         # --- Early warning ---
-        if epochs_since_improvement >= 15:
+        if best_tracking_so_far < float("inf") and epochs_since_improvement >= 15:
             print(
-                f"  WARNING: No eval improvement for {epochs_since_improvement} epochs. "
-                f"Best eval: {best_eval_so_far:.0f}. Consider stopping if no progress soon."
+                f"  WARNING: No tracked-metric improvement for {epochs_since_improvement} epochs. "
+                f"Best tracked metric: {best_tracking_so_far:.0f}. Consider stopping if no progress soon."
             )
 
         if epoch % args.save_interval == 0:
@@ -540,13 +647,53 @@ def parse_args():
     tp.add_argument("--save_interval", type=int, default=10)
     tp.add_argument("--episodes_per_epoch", type=int, default=8,
                      help="Episodes per epoch (more = stabler gradients)")
+    tp.add_argument("--eval_count", type=int, default=5,
+                     help="Number of fixed evaluation instances (0 disables eval)")
     tp.add_argument("--eval_instances", type=str, default=None,
-                     help="Directory of .vrp files for fixed evaluation")
+                     help="Directory (or single file) used as evaluation pool")
+    tp.add_argument("--holdout_count", type=int, default=0,
+                     help="Number of holdout instances (0 disables holdout)")
+    tp.add_argument("--holdout_instances", type=str, default=None,
+                     help="Directory (or single file) used as holdout pool")
+    tp.add_argument("--holdout_eval_interval", type=int, default=5,
+                     help="Evaluate holdout every N epochs")
+    tp.add_argument("--best_model_metric", type=str, default="eval",
+                     choices=["eval", "holdout", "composite"],
+                     help="Metric used to track/save best_model checkpoint")
+
+    # PPO training knobs
+    tp.add_argument("--gamma", type=float, default=0.95,
+                     help="Reward discount factor")
+    tp.add_argument("--lam", type=float, default=0.90,
+                     help="GAE lambda")
+    tp.add_argument("--epsilon_clip", type=float, default=0.2,
+                     help="PPO clipping epsilon")
+    tp.add_argument("--vf_coeff", type=float, default=0.5,
+                     help="Value loss coefficient")
     tp.add_argument("--manager_lr", type=float, default=1e-4)
+    tp.add_argument("--ppo_epochs", type=int, default=3,
+                     help="PPO mini-epochs per training epoch")
+    tp.add_argument("--max_grad_norm", type=float, default=0.5,
+                     help="Gradient clipping norm")
+    tp.add_argument("--target_kl", type=float, default=0.015,
+                     help="KL early-stop threshold (<=0 disables)")
+
+    # Reward/penalty controls
+    tp.add_argument("--reward_clip_min", type=float, default=-10.0,
+                     help="Lower reward clipping bound")
+    tp.add_argument("--reward_clip_max", type=float, default=10.0,
+                     help="Upper reward clipping bound")
+    tp.add_argument("--failure_penalty", type=float, default=-5.0,
+                     help="Penalty for fleet explosion / failed solve")
+    tp.add_argument("--no_improvement_penalty", type=float, default=-0.5,
+                     help="Penalty when a step does not beat episode-best score")
+
     tp.add_argument("--fp16", action="store_true",
                      help="Enable FP16 mixed precision (requires CUDA)")
     tp.add_argument("--ent_coeff", type=float, default=0.02,
                      help="Entropy bonus coefficient")
+    tp.add_argument("--run_tag", type=str, default="",
+                     help="Short run label stored in logs for traceability")
     tp.add_argument("--log_dir", type=str, default="logs",
                      help="Directory for CSV training metrics")
     tp.add_argument("--gdrive_path", type=str, default=None,

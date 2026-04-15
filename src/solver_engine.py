@@ -350,12 +350,18 @@ class CVRPEnv(gym.Env):
     ITERS_FORCE = ITERS_FORCE
     ITERS_PER_STEP = ITERS_PER_STEP  # For backward compat (logging)
 
+    # Reward/penalty defaults (can be overridden from training CLI)
+    FAILURE_PENALTY = -5.0
+    NO_IMPROVEMENT_PENALTY = -0.5
+
     def __init__(
         self,
         instance_paths: list[str | pathlib.Path],
         device: torch.device = torch.device("cpu"),
         max_steps: int = MAX_STEPS,
         max_nodes: int | None = None,
+        failure_penalty: float = FAILURE_PENALTY,
+        no_improvement_penalty: float = NO_IMPROVEMENT_PENALTY,
     ):
         super().__init__()
 
@@ -364,6 +370,8 @@ class CVRPEnv(gym.Env):
         self.instance_paths = self._filter_by_nodes(self._all_instance_paths)
         self.device = device
         self.max_steps = max_steps
+        self.failure_penalty = float(failure_penalty)
+        self.no_improvement_penalty = float(no_improvement_penalty)
 
         # Gymnasium space definitions
         self.observation_space = gym.spaces.Box(
@@ -387,6 +395,7 @@ class CVRPEnv(gym.Env):
         self._capacity: int = 1                      # Vehicle capacity (for nv_min)
         self._last_reward: float = 0.0               # Reward from previous step
         self._last_action: int = 0                   # Action from previous step
+        self._best_routes: list[list[int]] = []      # Best routes found this episode
 
     def _compute_nv_min(self) -> int:
         """Compute theoretical minimum fleet size: ceil(total_demand / capacity)."""
@@ -530,6 +539,7 @@ class CVRPEnv(gym.Env):
         self._best_nv = result["nv"]
         self._best_td = result["td"]
         self._best_score = result["score"]
+        self._best_routes = [list(route) for route in result.get("routes", [])]
         self._nv_initial = result["nv"]
         self._prev_cand_score = result["score"]
         self._step_count = 0
@@ -547,8 +557,6 @@ class CVRPEnv(gym.Env):
             "action_mask": self.get_action_mask(),
         }
         return obs, info
-
-    FAILURE_PENALTY = -5.0
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
         """Execute one HGS solve with the chosen strategy.
@@ -591,7 +599,7 @@ class CVRPEnv(gym.Env):
         # --- Reward: percentage improvement over episode best ---
         if fleet_exploded:
             self._iters_since_improvement += iters_used
-            reward = self.FAILURE_PENALTY
+            reward = self.failure_penalty
             cand_score = self._best_score  # Don't let failed solve corrupt tracking
         elif cand_score < self._best_score:
             # Beat the episode best — this is a real improvement
@@ -600,13 +608,14 @@ class CVRPEnv(gym.Env):
         else:
             # No improvement over best — small penalty for wasted compute
             self._iters_since_improvement += iters_used
-            reward = -0.5
+            reward = self.no_improvement_penalty
 
         # Update best-of-N tracking
         if cand_score < self._best_score:
             self._best_nv = cand_nv
             self._best_td = cand_td
             self._best_score = cand_score
+            self._best_routes = [list(route) for route in result.get("routes", [])]
             self._iters_since_improvement = 0
 
         self._prev_cand_score = cand_score
@@ -629,6 +638,10 @@ class CVRPEnv(gym.Env):
             "cand_score": cand_score,
         }
         return obs, reward, terminated, truncated, info
+
+    def get_best_routes(self) -> list[list[int]]:
+        """Return a copy of the best routes found in the current episode."""
+        return [list(route) for route in self._best_routes]
 
     # ------------------------------------------------------------------
     # Internal helpers

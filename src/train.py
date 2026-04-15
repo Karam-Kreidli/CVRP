@@ -31,10 +31,11 @@ KEY FEATURES:
 from __future__ import annotations
 
 import csv
+import json
 import pathlib
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Optional
 
 import numpy as np
@@ -109,6 +110,10 @@ class PPOConfig:
                                          # If the policy changes too much in one PPO update
                                          # (KL > 1.5 × target_kl), we stop early to prevent
                                          # catastrophic policy updates.
+
+    # --- Reward clipping ---
+    reward_clip_min: float = -10.0      # Lower clipping bound for rollout rewards.
+    reward_clip_max: float = 10.0       # Upper clipping bound for rollout rewards.
 
 
 # ---------------------------------------------------------------------------
@@ -248,12 +253,17 @@ class MARLTrainer:
         gdrive_path: Optional[str] = None,
         total_epochs: int = 100,
         eval_instances: list[str] | None = None,
+        holdout_instances: list[str] | None = None,
+        holdout_eval_interval: int = 5,
+        best_model_metric: str = "eval",
+        run_config: dict | None = None,
     ):
         self.env = env
         self.config = config
         self.device = device
         self.log_dir = pathlib.Path(log_dir)
         self.gdrive_path = gdrive_path
+        self.run_config = run_config or {}
 
         # --- Model ---
         # The Fleet Manager is the only trainable component.
@@ -294,34 +304,48 @@ class MARLTrainer:
         # AvgScore varies wildly because training uses random instances each episode.
         # Eval score on fixed instances is the TRUE measure of learning.
         self.eval_instances = eval_instances or []
+        self.holdout_instances = holdout_instances or []
+        self.holdout_eval_interval = max(1, int(holdout_eval_interval))
+        self.best_model_metric = best_model_metric
+        if self.best_model_metric not in {"eval", "holdout", "composite"}:
+            raise ValueError(
+                f"Unsupported best_model_metric='{self.best_model_metric}'. "
+                "Expected one of: eval, holdout, composite"
+            )
 
         # CSV log for plotting training curves
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = self.log_dir / "training_metrics.csv"
         self._csv_header_written = False
+        self._write_run_config()
+
+    def _write_run_config(self):
+        """Write one JSON metadata file per run for reproducibility."""
+        payload = {
+            "ppo_config": asdict(self.config),
+            "eval_instances": list(self.eval_instances),
+            "holdout_instances": list(self.holdout_instances),
+            "holdout_eval_interval": self.holdout_eval_interval,
+            "best_model_metric": self.best_model_metric,
+            "run_config": self.run_config,
+        }
+        run_config_path = self.log_dir / "run_config.json"
+        run_config_path.write_text(
+            json.dumps(payload, indent=2, default=str),
+            encoding="utf-8",
+        )
 
     # ------------------------------------------------------------------
     # Evaluation
     # ------------------------------------------------------------------
 
-    def evaluate(self) -> dict:
-        """Run greedy evaluation on fixed instances — the REAL progress metric.
-
-        WHY A SEPARATE EVALUATION?
-          During training, the agent runs on random instances with stochastic
-          action selection (exploration). The resulting AvgScore is very noisy —
-          it depends on which random instances were selected and which random
-          actions were sampled. You can't tell if the agent is actually learning.
-
-          Evaluation uses:
-            - The SAME 5 instances every time (consistency)
-            - GREEDY action selection (argmax, no randomness)
-          So the eval score purely reflects how well the POLICY has improved.
+    def _evaluate_instance_set(self, instance_paths: list[str]) -> dict:
+        """Run greedy evaluation on a provided instance set.
 
         Returns:
-            dict with eval_score, eval_nv, eval_td (averaged over 5 instances)
+            dict with keys: score, nv, td (averaged over the provided set)
         """
-        if not self.eval_instances:
+        if not instance_paths:
             return {}
 
         self.manager.eval()  # Switch to eval mode (disables dropout, etc.)
@@ -329,7 +353,7 @@ class MARLTrainer:
         scores, nvs, tds = [], [], []
         orig_paths = self.env.instance_paths  # Save original paths to restore later
 
-        for inst_path in self.eval_instances:
+        for inst_path in instance_paths:
             # Temporarily point the env at just this one instance
             self.env.instance_paths = [pathlib.Path(inst_path)]
             obs, info = self.env.reset()
@@ -352,7 +376,7 @@ class MARLTrainer:
                     ).unsqueeze(0)
 
                 # GREEDY action selection: pick the highest-scoring action
-                # (no sampling, no exploration — pure exploitation)
+                # (no sampling, no exploration - pure exploitation)
                 with torch.no_grad():
                     logits, _ = self.manager(
                         graph_emb, solver_stats, action_mask=mask_t
@@ -371,9 +395,47 @@ class MARLTrainer:
         self.env.instance_paths = orig_paths
 
         return {
-            "eval_score": float(np.mean(scores)),
-            "eval_nv": float(np.mean(nvs)),
-            "eval_td": float(np.mean(tds)),
+            "score": float(np.mean(scores)),
+            "nv": float(np.mean(nvs)),
+            "td": float(np.mean(tds)),
+        }
+
+    def evaluate(self) -> dict:
+        """Run greedy evaluation on fixed instances - the REAL progress metric.
+
+        WHY A SEPARATE EVALUATION?
+          During training, the agent runs on random instances with stochastic
+          action selection (exploration). The resulting AvgScore is very noisy —
+          it depends on which random instances were selected and which random
+          actions were sampled. You can't tell if the agent is actually learning.
+
+          Evaluation uses:
+            - The SAME 5 instances every time (consistency)
+            - GREEDY action selection (argmax, no randomness)
+          So the eval score purely reflects how well the POLICY has improved.
+
+        Returns:
+            dict with eval_score, eval_nv, eval_td (averaged over 5 instances)
+        """
+        metrics = self._evaluate_instance_set(self.eval_instances)
+        if not metrics:
+            return {}
+
+        return {
+            "eval_score": metrics["score"],
+            "eval_nv": metrics["nv"],
+            "eval_td": metrics["td"],
+        }
+
+    def evaluate_holdout(self) -> dict:
+        """Run greedy evaluation on a separate holdout split."""
+        metrics = self._evaluate_instance_set(self.holdout_instances)
+        if not metrics:
+            return {}
+        return {
+            "holdout_eval_score": metrics["score"],
+            "holdout_eval_nv": metrics["nv"],
+            "holdout_eval_td": metrics["td"],
         }
 
     # ------------------------------------------------------------------
@@ -482,7 +544,7 @@ class MARLTrainer:
         # keeps most values in a reasonable range naturally.
         if len(self.buffer) > 0:
             raw = np.array(self.buffer.rewards)
-            clipped = np.clip(raw, REWARD_CLIP_MIN, REWARD_CLIP_MAX)
+            clipped = np.clip(raw, self.config.reward_clip_min, self.config.reward_clip_max)
             self.buffer.rewards = clipped.tolist()
 
         # --- Compute Advantages ---
@@ -665,7 +727,12 @@ class MARLTrainer:
     # Training Loop
     # ------------------------------------------------------------------
 
-    def train_epoch(self, num_episodes: int = 1, run_eval: bool = True) -> dict:
+    def train_epoch(
+        self,
+        num_episodes: int = 1,
+        run_eval: bool = True,
+        epoch_index: int | None = None,
+    ) -> dict:
         """One full training epoch: collect → update → evaluate.
 
         This is the top-level training step called once per epoch:
@@ -690,16 +757,64 @@ class MARLTrainer:
 
         # Phase 3: Evaluate on fixed instances (no exploration)
         eval_stats = self.evaluate() if run_eval else {}
+        holdout_stats = {}
+        if run_eval and self.holdout_instances:
+            epoch_num = epoch_index if epoch_index is not None else (len(self.epoch_stats) + 1)
+            if epoch_num % self.holdout_eval_interval == 0:
+                holdout_stats = self.evaluate_holdout()
 
         # Combine all metrics into one dict
         stats = {
             **rollout_stats,
             **eval_stats,
+            **holdout_stats,
             "policy_loss": ppo_stats["policy_loss"],
             "value_loss": ppo_stats["value_loss"],
             "entropy": ppo_stats["entropy"],
             "lr": self.optimizer.param_groups[0]["lr"],
+            "gamma": self.config.gamma,
+            "lam": self.config.lam,
+            "epsilon_clip": self.config.epsilon_clip,
+            "vf_coeff": self.config.vf_coeff,
+            "ent_coeff": self.config.ent_coeff,
+            "manager_lr_init": self.config.manager_lr,
+            "ppo_epochs": self.config.ppo_epochs,
+            "mini_batch_size": self.config.mini_batch_size,
+            "max_grad_norm": self.config.max_grad_norm,
+            "target_kl": "" if self.config.target_kl is None else self.config.target_kl,
+            "reward_clip_min": self.config.reward_clip_min,
+            "reward_clip_max": self.config.reward_clip_max,
+            "failure_penalty": getattr(self.env, "failure_penalty", ""),
+            "no_improvement_penalty": getattr(self.env, "no_improvement_penalty", ""),
+            "eval_instances_count": len(self.eval_instances),
+            "holdout_instances_count": len(self.holdout_instances),
+            "holdout_eval_interval": self.holdout_eval_interval,
+            "best_model_metric": self.best_model_metric,
+            "run_tag": self.run_config.get("run_tag", ""),
         }
+
+        # Choose which metric controls best-checkpoint tracking.
+        # For holdout/composite modes we only update best checkpoints on epochs
+        # where holdout is actually evaluated.
+        selection_metric = "eval_score"
+        tracking_score = stats.get("eval_score", stats.get("best_score", float("inf")))
+
+        if self.best_model_metric == "holdout":
+            selection_metric = "holdout_eval_score"
+            if "holdout_eval_score" in stats:
+                tracking_score = stats["holdout_eval_score"]
+            else:
+                tracking_score = float("inf")
+        elif self.best_model_metric == "composite":
+            selection_metric = "composite_eval_holdout"
+            if "eval_score" in stats and "holdout_eval_score" in stats:
+                tracking_score = 0.5 * (stats["eval_score"] + stats["holdout_eval_score"])
+            else:
+                tracking_score = float("inf")
+
+        stats["selection_metric"] = selection_metric
+        stats["tracking_score"] = "" if not np.isfinite(tracking_score) else float(tracking_score)
+
         self.epoch_stats.append(stats)
         self._write_csv(stats)
 
@@ -707,7 +822,6 @@ class MARLTrainer:
         # Save the model whenever eval score improves (lower is better).
         # This ensures we always have the best-performing policy saved,
         # even if later training epochs regress.
-        tracking_score = stats.get("eval_score", stats.get("best_score", float("inf")))
         if tracking_score < self.best_score:
             self.best_score = tracking_score
             best_path = self.log_dir / "best_model.pth"
@@ -724,6 +838,15 @@ class MARLTrainer:
             "eval_score", "eval_nv", "eval_td",
             "num_episodes", "total_reward", "total_steps",
             "policy_loss", "value_loss", "entropy", "lr",
+            "gamma", "lam", "epsilon_clip", "vf_coeff", "ent_coeff",
+            "manager_lr_init", "ppo_epochs", "mini_batch_size", "max_grad_norm", "target_kl",
+            "reward_clip_min", "reward_clip_max",
+            "failure_penalty", "no_improvement_penalty",
+            "eval_instances_count",
+            "holdout_eval_score", "holdout_eval_nv", "holdout_eval_td",
+            "holdout_instances_count", "holdout_eval_interval",
+            "best_model_metric", "selection_metric", "tracking_score",
+            "run_tag",
         ]
         row = {k: stats.get(k, "") for k in fieldnames}
         row["epoch"] = len(self.epoch_stats)
