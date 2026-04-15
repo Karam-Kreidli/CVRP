@@ -143,12 +143,12 @@ class RolloutBuffer:
     def store(self, obs, action, log_prob, value, reward, done, action_mask=None):
         """Record one transition (one step of one episode)."""
         self.observations.append(obs)     # (OBS_DIM,) observation vector
-        self.actions.append(action)       # int: which action was taken (0-6)
+        self.actions.append(action)       # int: which action was taken (0-9)
         self.log_probs.append(log_prob)   # float: log π(a|s) at the time of action selection
         self.values.append(value)         # float: V(s) from the critic
         self.rewards.append(reward)       # float: reward received (after normalization)
         self.dones.append(done)           # bool: was this the last step of the episode?
-        self.action_masks.append(action_mask)  # (7,) bool: which actions were allowed
+        self.action_masks.append(action_mask)  # (10,) bool: which actions were allowed
 
     def clear(self):
         """Reset the buffer for a new epoch."""

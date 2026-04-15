@@ -50,7 +50,7 @@ The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance 
                 |       + solver_stats  |
                 |       = (1, 19)       |
                 |                       |
-                |  Output: action (0-6) |
+                |  Output: action (0-9) |
                 +-----------------------+
                             |
                    action (strategy choice)
@@ -150,7 +150,7 @@ obs = [ instance_features (12) | solver_stats (7) ]
 | last_reward | clipped last reward / 10 | Feedback from previous action |
 | last_action_norm | last_action / NUM_ACTIONS | What was tried last |
 
-**Action Space (7 discrete actions):**
+**Action Space (10 discrete actions):**
 
 Each action controls three dimensions: **fleet target** (how many vehicles to allow), **seed strategy** (same or new random seed), and **iteration budget** (how much compute to spend):
 
@@ -163,10 +163,13 @@ Each action controls three dimensions: **fleet target** (how many vehicles to al
 | 4 | PUSH_SAME | best_nv - 1 | Same | 1000 | Try to remove one vehicle |
 | 5 | PUSH_NEW | best_nv - 1 | New | 1000 | Fresh start, remove one vehicle |
 | 6 | FORCE_MIN | nv_min | New | 1500 | Force theoretical minimum fleet |
+| 7 | FREE_DIVERSE_NEW | Unconstrained | New | 500 | Same budget as FREE_NEW but with diversity-biased HGS population settings |
+| 8 | LOCK_AGGR_NEW | Lock best NV | New | 500 | Same budget as LOCK_NEW but with aggressive local-search bias |
+| 9 | PUSH_BALANCED_NEW | best_nv - 1 | New | 1000 | Same budget as PUSH_NEW but with balanced explore/exploit HGS settings |
 
 The key insight: removing one vehicle saves 1000 in score, but forcing fewer vehicles can fail entirely. The agent must learn **when** pushing is worth the risk — this is instance-dependent and changes as the search progresses.
 
-**Action Masking:** When NV <= NV_min (theoretical minimum fleet = ceil(total_demand / capacity)), actions 4, 5, 6 (PUSH_SAME, PUSH_NEW, FORCE_MIN) are blocked since further fleet reduction is impossible.
+**Action Masking:** When NV <= NV_min (theoretical minimum fleet = ceil(total_demand / capacity)), actions 4, 5, 6, 9 (PUSH_SAME, PUSH_NEW, FORCE_MIN, PUSH_BALANCED_NEW) are blocked since further fleet reduction is impossible.
 
 **Network:**
 ```
@@ -182,14 +185,14 @@ Linear(64 -> 64) + ReLU
      |             |
      v             v
   Actor         Critic
-Linear(64->7)  Linear(64->1)
+Linear(64->10) Linear(64->1)
      |             |
      v             v
 action_logits  state_value
-  (B, 7)        (B, 1)
+ (B, 10)        (B, 1)
 ```
 
-- **Parameters:** ~5,960
+- **Parameters:** ~6,155
 - Intentionally small — the agent makes strategic decisions, not complex computations
 
 ---
@@ -208,7 +211,7 @@ reset()
   |
   v
 step(action) x 50 times
-  |-> Map action to (fleet_target, seed, iteration_budget)
+  |-> Map action to (fleet_target, seed, iteration_budget, optional HGS bias)
   |-> Run FRESH solver for 500-1500 iterations
   |-> Track best solution across all steps
   |-> Compute reward (pct improvement vs episode best)
@@ -227,6 +230,8 @@ The Fleet Manager doesn't directly modify routes. It controls two key levers:
 2. **Random seed**: Same seed reproduces the same search trajectory. A new seed explores a different region of the solution space, potentially escaping local optima.
 
 3. **Iteration budget**: Harder tasks (PUSH, FORCE) get more iterations (1000-1500) since finding feasible solutions with fewer vehicles requires deeper search.
+
+4. **HGS search bias (new actions only)**: The three added actions keep the same iteration tiers but inject curated HGS parameter overrides (population and local-search knobs) so the policy can choose between different search styles without increasing architecture complexity.
 
 **Key difference from warm-starting solvers:** Each step runs a **fresh** HGS solve (no warm starting). The environment tracks the best solution found across ALL steps in the episode.
 
@@ -324,13 +329,14 @@ This helps the agent learn basic strategies on easier problems before tackling h
      [inst_feat | stats]       |
            |                   |
            v                   |
-     Picks action (0-6)        |
+     Picks action (0-9)        |
            |                   |
            +-------------------+
            |
            v
      HGS solves with
      chosen fleet target + seed
+     + optional search-bias preset
      (500-1500 iterations)
            |
            v

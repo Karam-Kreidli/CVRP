@@ -18,14 +18,18 @@ WHAT THE ACTIONS ACTUALLY DO:
     - Should I try to REDUCE the fleet? (huge score impact but risky)
     - Should I try a NEW SEED? (escape local optima)
     - How much COMPUTE to invest? (tighter fleet gets more budget)
+    - Should I use a different HGS search bias? (for selected actions)
 
-  0 = FREE_SAME       — Let HGS decide fleet, same seed, 500 iters
-  1 = FREE_NEW        — Let HGS decide fleet, new seed, 500 iters
-  2 = LOCK_SAME       — Lock at current best NV, same seed, 500 iters
-  3 = LOCK_NEW        — Lock at current best NV, new seed, 500 iters
-  4 = PUSH_SAME       — Try best_nv - 1, same seed, 1000 iters
-  5 = PUSH_NEW        — Try best_nv - 1, new seed, 1000 iters
-  6 = FORCE_MIN       — Force theoretical minimum NV, new seed, 1500 iters
+    0 = FREE_SAME        — Let HGS decide fleet, same seed, 500 iters
+    1 = FREE_NEW         — Let HGS decide fleet, new seed, 500 iters
+    2 = LOCK_SAME        — Lock at current best NV, same seed, 500 iters
+    3 = LOCK_NEW         — Lock at current best NV, new seed, 500 iters
+    4 = PUSH_SAME        — Try best_nv - 1, same seed, 1000 iters
+    5 = PUSH_NEW         — Try best_nv - 1, new seed, 1000 iters
+    6 = FORCE_MIN        — Force theoretical minimum NV, new seed, 1500 iters
+    7 = FREE_DIVERSE_NEW — Free fleet, new seed, 500 iters, diversity-biased HGS params
+    8 = LOCK_AGGR_NEW    — Lock best NV, new seed, 500 iters, aggressive local-search bias
+    9 = PUSH_BALANCED_NEW — Push best_nv - 1, new seed, 1000 iters, balanced HGS params
 
 REWARD:
     Percentage-based improvement over the episode-best score.
@@ -54,7 +58,7 @@ import hygese as hgs
 INSTANCE_FEATURES_DIM = 12   # Hand-crafted instance features
 STATS_DIM = 7                # Solver stats: time, nv_ratio, score_ratio, stagnation, nv_gap, last_reward, last_action
 OBS_DIM = INSTANCE_FEATURES_DIM + STATS_DIM  # 19 = total observation dimension
-NUM_ACTIONS = 7              # Number of discrete strategy choices
+NUM_ACTIONS = 10             # Number of discrete strategy choices
 MAX_STEPS = 50               # Steps per episode
 TIME_PER_STEP = 0.0          # HGS time limit per step (0 = use nbIter only)
 
@@ -67,7 +71,17 @@ ITERS_PER_STEP = ITERS_FREE  # Default for compatibility (used in train.py loggi
 ACTION_NAMES = [
     "FREE_SAME", "FREE_NEW", "LOCK_SAME",
     "LOCK_NEW", "PUSH_SAME", "PUSH_NEW", "FORCE_MIN",
+    "FREE_DIVERSE_NEW", "LOCK_AGGR_NEW", "PUSH_BALANCED_NEW",
 ]
+
+# Action-specific HGS parameter overrides for the three newly added actions.
+# These presets are intentionally low-cost (same iteration tiers) and only
+# alter search bias, not fundamental solver behavior.
+ACTION_HGS_OVERRIDES: dict[int, dict[str, float | int]] = {
+    7: dict(mu=40, lambda_=60, nbGranular=30, targetFeasible=0.3, nbElite=6, nbClose=8),
+    8: dict(mu=15, lambda_=20, nbGranular=15, targetFeasible=0.1, nbElite=2, nbClose=3),
+    9: dict(mu=20, lambda_=60, nbGranular=25, targetFeasible=0.15, nbElite=3, nbClose=4),
+}
 
 
 def competition_score(nv: int, td: float) -> float:
@@ -319,6 +333,7 @@ class CVRPEnv(gym.Env):
         - Fleet target: free / lock at best_nv / push to best_nv-1 / force nv_min
         - Seed: same seed (reproducible) or new seed (escape local optima)
         - Iteration budget: 500 (quick) / 1000 (medium) / 1500 (thorough)
+                - Optional HGS search-bias overrides for selected actions
 
     Args:
         instance_paths: List of paths to .vrp files (X-dataset format).
@@ -380,10 +395,10 @@ class CVRPEnv(gym.Env):
         return max(1, math.ceil(total_demand / capacity))
 
     def get_action_mask(self) -> np.ndarray:
-        """Return a boolean mask over 7 actions. True = allowed, False = blocked.
+        """Return a boolean mask over 10 actions. True = allowed, False = blocked.
 
         Block fleet-reduction actions when they can't possibly help:
-        - PUSH (4,5) blocked when best_nv <= nv_min (can't go lower)
+        - PUSH (4,5,9) blocked when best_nv <= nv_min (can't go lower)
         - FORCE_MIN (6) blocked when best_nv <= nv_min (already there)
         """
         mask = np.ones(NUM_ACTIONS, dtype=bool)
@@ -391,6 +406,7 @@ class CVRPEnv(gym.Env):
             mask[4] = False  # PUSH_SAME
             mask[5] = False  # PUSH_NEW
             mask[6] = False  # FORCE_MIN
+            mask[9] = False  # PUSH_BALANCED_NEW
         return mask
 
     def _filter_by_nodes(self, paths: list[pathlib.Path]) -> list[pathlib.Path]:
@@ -549,7 +565,7 @@ class CVRPEnv(gym.Env):
           - Larger penalty (-5.0) for fleet explosions (NV spike > 2)
 
         Args:
-            action: 0-6, one of the seven strategy actions.
+            action: 0-9, one of the ten strategy actions.
 
         Returns:
             observation, reward, terminated, truncated, info
@@ -677,6 +693,9 @@ class CVRPEnv(gym.Env):
           4 = PUSH_SAME   — Push to best_nv-1, same seed, 1000 iters
           5 = PUSH_NEW    — Push to best_nv-1, new seed, 1000 iters
           6 = FORCE_MIN   — Force nv_min, new seed, 1500 iters
+          7 = FREE_DIVERSE_NEW  — Free fleet, new seed, 500 iters, diversity-biased params
+          8 = LOCK_AGGR_NEW     — Lock at best_nv, new seed, 500 iters, aggressive params
+          9 = PUSH_BALANCED_NEW — Push to best_nv-1, new seed, 1000 iters, balanced params
 
         Returns:
             params: HGS AlgorithmParameters
@@ -684,7 +703,7 @@ class CVRPEnv(gym.Env):
             iters_used: iteration budget for this step
         """
         # Determine seed
-        new_seed = action in (1, 3, 5, 6)
+        new_seed = action in (1, 3, 5, 6, 7, 8, 9)
         if new_seed:
             self._seed = random.randint(0, 2**31)
 
@@ -705,12 +724,28 @@ class CVRPEnv(gym.Env):
             # FORCE_MIN: force theoretical minimum fleet
             num_vehicles = self._nv_min
             iters = ITERS_FORCE
+        elif action == 7:
+            # FREE_DIVERSE_NEW: unconstrained fleet with diversity-focused search
+            num_vehicles = None
+            iters = ITERS_FREE
+        elif action == 8:
+            # LOCK_AGGR_NEW: lock fleet and use aggressive local-search settings
+            num_vehicles = self._best_nv
+            iters = ITERS_FREE
+        elif action == 9:
+            # PUSH_BALANCED_NEW: push one vehicle lower with balanced exploration
+            num_vehicles = max(self._nv_min, self._best_nv - 1)
+            iters = ITERS_PUSH
         else:
-            raise ValueError(f"Invalid action: {action}. Expected 0-6.")
+            raise ValueError(f"Invalid action: {action}. Expected 0-9.")
+
+        # Apply optional action-specific HGS search-bias overrides.
+        hgs_overrides = ACTION_HGS_OVERRIDES.get(action, {})
 
         params = hgs.AlgorithmParameters(
             timeLimit=TIME_PER_STEP,
             nbIter=iters,
             seed=self._seed,
+            **hgs_overrides,
         )
         return params, num_vehicles, iters

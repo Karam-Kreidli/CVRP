@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 
 import torch
 import hygese as hgs
-from src.agent_manager import FleetManager, INSTANCE_FEATURES_DIM
+from src.agent_manager import FleetManager, INSTANCE_FEATURES_DIM, ACTION_NAMES
 from src.solver_engine import CVRPEnv, _parse_vrp_file
 
 # =============================================================================
@@ -63,9 +63,6 @@ if os.path.exists(MODEL_PATH):
 else:
     print(f"\n[WARNING] {MODEL_PATH} not found. Running with untrained, random weights!\n")
 
-
-# Human-readable actions for logging
-ACTION_NAMES = ["FREE_SAME", "FREE_NEW", "LOCK_SAME", "LOCK_NEW", "PUSH_SAME", "PUSH_NEW", "FORCE_MIN"]
 
 # =============================================================================
 # HELPER UTILITIES
@@ -167,7 +164,7 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
         
         jobs[job_id]["stage_statuses"]["1"] = "done"
         jobs[job_id]["stage_times_seconds"]["1"] = round(time.time() - start_time, 2)
-        jobs[job_id]["log_lines"].append(f"[FE] Feature extraction complete — 7-dim vector")
+        jobs[job_id]["log_lines"].append(f"[FE] Feature extraction complete — 12-dim vector")
         
         # Initialize best score tracking from the baseline solve
         initial_nv = info.get("nv", 0)
@@ -215,16 +212,33 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
             
             # Calculate these manually because the env doesn't return them
             action_name = info["action_name"]
-            iters_this_step = 500 if action < 4 else (1000 if action < 6 else 1500)
+            # Keep backend telemetry in sync with the environment action design.
+            if action_name in {"FREE_SAME", "FREE_NEW", "LOCK_SAME", "LOCK_NEW", "FREE_DIVERSE_NEW", "LOCK_AGGR_NEW"}:
+                iters_this_step = 500
+            elif action_name in {"PUSH_SAME", "PUSH_NEW", "PUSH_BALANCED_NEW"}:
+                iters_this_step = 1000
+            elif action_name == "FORCE_MIN":
+                iters_this_step = 1500
+            else:
+                iters_this_step = 500
             total_iters += iters_this_step
 
-            if action in [0, 1]: target = "None"
-            elif action in [2, 3]: target = str(jobs[job_id]["best_nv"])
-            elif action in [4, 5]: target = str(jobs[job_id]["best_nv"] - 1)
-            elif action == 6: target = str(jobs[job_id]["nv_min"])
-            else: target = "Unknown"
+            if action_name in {"FREE_SAME", "FREE_NEW", "FREE_DIVERSE_NEW"}:
+                target = "None"
+            elif action_name in {"LOCK_SAME", "LOCK_NEW", "LOCK_AGGR_NEW"}:
+                target = str(jobs[job_id]["best_nv"])
+            elif action_name in {"PUSH_SAME", "PUSH_NEW", "PUSH_BALANCED_NEW"}:
+                # Match the environment logic: push is clamped at nv_min.
+                target = str(max(jobs[job_id]["nv_min"], jobs[job_id]["best_nv"] - 1))
+            elif action_name == "FORCE_MIN":
+                target = str(jobs[job_id]["nv_min"])
+            else:
+                target = "Unknown"
             
-            seed_type = "new" if action in [1, 3, 5, 6] else "same"
+            seed_type = "new" if action_name in {
+                "FREE_NEW", "LOCK_NEW", "PUSH_NEW", "FORCE_MIN",
+                "FREE_DIVERSE_NEW", "LOCK_AGGR_NEW", "PUSH_BALANCED_NEW",
+            } else "same"
 
             # Sync live data to dict
             jobs[job_id]["current_action"] = action_name

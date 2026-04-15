@@ -9,7 +9,7 @@ WHAT IT DOES:
   At each of the 50 steps in an episode, the Fleet Manager looks at:
     1. Instance features (12-dim — size, demand, spatial, and radial stats)
     2. Seven real-time statistics from the solver ("how is the search going?")
-  And chooses one of 7 strategic actions for the next solve.
+  And chooses one of 10 strategic actions for the next solve.
 
 OBSERVATION (what the agent sees):
   19-dim vector = [instance_features (12) | solver_stats (7)]
@@ -33,15 +33,18 @@ ACTION SPACE (what the agent can do):
   4 = PUSH_SAME    — Push best_nv-1, same seed, 1000 iters
   5 = PUSH_NEW     — Push best_nv-1, new seed, 1000 iters
   6 = FORCE_MIN    — Force nv_min, new seed, 1500 iters
+  7 = FREE_DIVERSE_NEW  — Free fleet, new seed, 500 iters (diversity-biased HGS params)
+  8 = LOCK_AGGR_NEW     — Lock best NV, new seed, 500 iters (aggressive local-search bias)
+  9 = PUSH_BALANCED_NEW — Push best_nv-1, new seed, 1000 iters (balanced explore/exploit HGS params)
 
 ARCHITECTURE: Actor-Critic
   The network has two "heads" sharing a common trunk:
-    - Actor: outputs a probability distribution over the 7 actions (policy)
+    - Actor: outputs a probability distribution over the 10 actions (policy)
     - Critic: outputs a single number estimating "how good is this state?" (value)
   PPO uses both during training — the actor learns better actions, the critic
   learns to evaluate states for computing advantages (see train.py).
 
-Parameters: ~5,960 (intentionally tiny — it's making strategic decisions, not
+Parameters: ~6,155 (intentionally tiny — it's making strategic decisions, not
 computing routes)
 """
 
@@ -55,12 +58,13 @@ INSTANCE_FEATURES_DIM = 12  # Hand-crafted instance features
 SOLVER_STATS_DIM = 7       # [time_ratio, nv_ratio, score_ratio, stagnation, nv_gap, last_reward, last_action]
 
 # Total number of discrete strategy choices available to the agent
-NUM_FLEET_ACTIONS = 7
+NUM_FLEET_ACTIONS = 10
 
 # Human-readable names for each action (used in logging and debugging)
 ACTION_NAMES = [
     "FREE_SAME", "FREE_NEW", "LOCK_SAME",
     "LOCK_NEW", "PUSH_SAME", "PUSH_NEW", "FORCE_MIN",
+    "FREE_DIVERSE_NEW", "LOCK_AGGR_NEW", "PUSH_BALANCED_NEW",
 ]
 
 
@@ -80,7 +84,7 @@ class FleetManager(nn.Module):
         embed_dim: Dimension of instance features (12).
         stats_dim: Dimension of solver statistics vector (7).
         hidden_dim: Width of hidden layers (64).
-        num_actions: Number of discrete strategy choices (7).
+        num_actions: Number of discrete strategy choices (10).
     """
 
     def __init__(
@@ -105,10 +109,10 @@ class FleetManager(nn.Module):
         )
 
         # --- Actor Head (Policy) ---
-        # Outputs raw logits (unnormalized scores) for each of the 7 actions.
+        # Outputs raw logits (unnormalized scores) for each action.
         # These logits are converted to probabilities via softmax in Categorical().
         # Higher logit = higher probability of choosing that action.
-        self.actor = nn.Linear(hidden_dim, num_actions)  # 64 → 7
+        self.actor = nn.Linear(hidden_dim, num_actions)  # 64 → 10 (default)
 
         # --- Critic Head (Value Function) ---
         # Outputs a single scalar V(s) — the estimated cumulative future reward
@@ -131,17 +135,18 @@ class FleetManager(nn.Module):
 
         ACTION MASKING:
           When the fleet is already at the theoretical minimum (NV <= NV_min),
-          fleet-reduction actions (4=PUSH_SAME, 5=PUSH_NEW, 6=FORCE_MIN) are
+          fleet-reduction actions (4=PUSH_SAME, 5=PUSH_NEW, 6=FORCE_MIN,
+          9=PUSH_BALANCED_NEW) are
           blocked by setting their logits to -10000, making their probability
           essentially zero after softmax.
 
         Args:
             graph_embedding: (B, 12) hand-crafted instance features.
             solver_stats:    (B, 7) real-time solver feedback.
-            action_mask:     (B, 7) bool tensor. True = action allowed, False = blocked.
+            action_mask:     (B, 10) bool tensor. True = action allowed, False = blocked.
 
         Returns:
-            action_logits: (B, 7) raw scores for each action (masked ones set to -1e4).
+            action_logits: (B, 10) raw scores for each action (masked ones set to -1e4).
             state_value:   (B, 1) estimated future reward from this state.
         """
         # Concatenate instance features + solver feedback into one observation
@@ -151,7 +156,7 @@ class FleetManager(nn.Module):
         features = self.shared(obs)           # (B, 64)
 
         # Actor: score each possible action
-        action_logits = self.actor(features)  # (B, 7)
+        action_logits = self.actor(features)  # (B, 10)
 
         # Apply action mask: set blocked actions to -10000 so softmax gives ~0 probability
         if action_mask is not None:
@@ -180,10 +185,10 @@ class FleetManager(nn.Module):
         Args:
             graph_embedding: (B, 12) hand-crafted instance features.
             solver_stats:    (B, 7) solver statistics.
-            action_mask:     (B, 7) bool tensor. True = allowed, False = masked.
+            action_mask:     (B, 10) bool tensor. True = allowed, False = masked.
 
         Returns:
-            action:      (B,) sampled action index (0-6).
+            action:      (B,) sampled action index (0-9).
             log_prob:    (B,) log-probability of the sampled action (for PPO).
             state_value: (B, 1) critic's value estimate (for advantage computation).
         """

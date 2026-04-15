@@ -53,7 +53,7 @@ Computed once per instance at episode start, then reused for all 50 steps. Pairw
 
 ### Stage 2 — Fleet Manager (`agent_manager.py`)
 
-**What it does:** The RL agent — the "brain" of the system. At each step, it looks at 12 instance features + 7 real-time solver statistics and chooses one of 7 fleet-target strategies.
+**What it does:** The RL agent — the "brain" of the system. At each step, it looks at 12 instance features + 7 real-time solver statistics and chooses one of 10 fleet-target strategies.
 
 **Observation (19-dim vector):**
 ```
@@ -67,9 +67,9 @@ The 7 solver statistics:
 - **stagnation_ratio** = iters_no_improve / budget — "Am I stuck?"
 - **nv_gap** = (best_nv - nv_min) / NV_initial — "How far from minimum fleet?"
 - **last_reward** = clipped last reward / 10 — "Did the previous action help?"
-- **last_action_norm** = last_action / 7 — "What did I just try?"
+- **last_action_norm** = last_action / NUM_ACTIONS — "What did I just try?"
 
-**Action Space (7 discrete actions):**
+**Action Space (10 discrete actions):**
 
 Each action controls three dimensions: **fleet target** (how many vehicles to allow), **seed strategy** (same or new random seed), and **iteration budget** (how much compute to spend):
 
@@ -82,26 +82,29 @@ Each action controls three dimensions: **fleet target** (how many vehicles to al
 | 4 | PUSH_SAME | best_nv - 1 | Same | 1000 | Try to remove one vehicle |
 | 5 | PUSH_NEW | best_nv - 1 | New | 1000 | Fresh start, remove one vehicle |
 | 6 | FORCE_MIN | nv_min | New | 1500 | Force theoretical minimum fleet |
+| 7 | FREE_DIVERSE_NEW | Unconstrained | New | 500 | Diversity-focused HGS settings without extra iteration cost |
+| 8 | LOCK_AGGR_NEW | Lock best NV | New | 500 | Aggressive local-search settings at fixed fleet size |
+| 9 | PUSH_BALANCED_NEW | best_nv - 1 | New | 1000 | Balanced HGS settings for push attempts |
 
 The key insight: removing one vehicle saves 1000 in score, but forcing fewer vehicles can fail entirely. The agent must learn **when** pushing is worth the risk.
 
 **Network:** Actor-Critic with shared trunk
 ```
 obs (19) --> Linear(19->64) + ReLU --> Linear(64->64) + ReLU
-                                              |
-                              +---------------+---------------+
-                              |                               |
-                         Actor Head                     Critic Head
-                       Linear(64->7)                   Linear(64->1)
-                              |                               |
-                     action_logits (7)                state_value (1)
+                                     |
+                        +---------------+---------------+
+                        |                               |
+                    Actor Head                     Critic Head
+                   Linear(64->10)                 Linear(64->1)
+                        |                               |
+                 action_logits (10)              state_value (1)
 ```
 
-- **Actor** outputs a probability distribution over the 7 actions (the policy)
+- **Actor** outputs a probability distribution over the 10 actions (the policy)
 - **Critic** outputs a single number estimating "how good is this state?" (the value function)
-- **Parameters:** ~5,960 — intentionally tiny since it makes strategic decisions, not route computations
+- **Parameters:** ~6,155 — intentionally tiny since it makes strategic decisions, not route computations
 
-**Action Masking:** When the fleet is already at the theoretical minimum (NV <= NV_min = ceil(total_demand / capacity)), actions 4, 5, 6 (PUSH_SAME, PUSH_NEW, FORCE_MIN) are blocked by setting their logits to -10,000. After softmax, these become ~0 probability, preventing the agent from attempting impossible fleet reductions.
+**Action Masking:** When the fleet is already at the theoretical minimum (NV <= NV_min = ceil(total_demand / capacity)), actions 4, 5, 6, 9 (PUSH_SAME, PUSH_NEW, FORCE_MIN, PUSH_BALANCED_NEW) are blocked by setting their logits to -10,000. After softmax, these become ~0 probability, preventing the agent from attempting impossible fleet reductions.
 
 ---
 
@@ -116,13 +119,14 @@ obs (19) --> Linear(19->64) + ReLU --> Linear(64->64) + ReLU
 
 **Why 500 iterations per step?**
 
-At 5,000 iterations (the previous design), HGS had essentially converged — the population stabilized and all 7 actions produced identical results. The agent got zero reward signal and couldn't learn. At 500 iterations, HGS is still actively searching, so different configs produce meaningfully different outcomes.
+At 5,000 iterations (the previous design), HGS had essentially converged — the population stabilized and different action choices tended to collapse to similar outcomes. The agent got weak reward signal and couldn't learn. At 500 iterations, HGS is still actively searching, so strategy differences produce meaningfully different outcomes.
 
 **How actions become solver parameters:**
 The Fleet Manager doesn't touch routes directly. It controls two key levers:
 - **num_vehicles** — Constrains how many vehicles HGS can use. Setting this to `best_nv - 1` forces HGS to find a solution with one fewer vehicle. If it succeeds, that's a 1000-point score improvement. If it fails, the result is discarded.
 - **seed** — Same seed = reproducible search. New seed = different starting point (escape local optima).
 - **iteration budget** — Harder tasks (PUSH, FORCE) get more iterations (1000-1500) since finding feasible solutions with fewer vehicles requires deeper search.
+- **search bias knobs (for selected new actions)** — Additional HGS parameters (population/local-search settings) let the policy choose alternate search styles at the same iteration budget.
 
 **Important: No warm starting.** HGS does not accept a previous solution as input. Each step runs a completely fresh solve. The environment tracks the best solution found across all steps in the episode.
 
@@ -162,7 +166,7 @@ In our system:
 - **Agent** = Fleet Manager
 - **Environment** = CVRPEnv (HGS-CVRP solver wrapper)
 - **State** = 19-dim observation vector (instance features + solver stats)
-- **Action** = One of 7 fleet-target strategies (FREE/LOCK/PUSH/FORCE x SAME/NEW seed)
+- **Action** = One of 10 fleet-target strategies (original 7 + 3 HGS-bias variants)
 - **Reward** = Percentage improvement over episode best (or -0.5 / -5.0 penalties)
 
 ### Policy and Value Functions
@@ -176,7 +180,7 @@ In our system:
 Our Fleet Manager uses an **Actor-Critic** design with a **shared trunk**:
 
 - The **shared trunk** (two 64-unit layers) extracts features common to both policy and value estimation. Sharing is efficient and keeps the critic's estimates aligned with the actor's policy.
-- The **Actor** head outputs logits for each of the 7 actions. These are converted to probabilities by the Categorical distribution (softmax internally).
+- The **Actor** head outputs logits for each of the 10 actions. These are converted to probabilities by the Categorical distribution (softmax internally).
 - The **Critic** head outputs a scalar V(s). PPO uses this to compute advantages.
 
 ### Advantage Estimation (GAE-lambda)
@@ -344,11 +348,11 @@ This guarantees competition-ready solutions regardless of whether RL training su
 
 | File | Role | Parameters |
 |------|------|-----------|
-| `agent_manager.py` | Fleet Manager — RL agent (Actor-Critic) | ~5,960 |
+| `agent_manager.py` | Fleet Manager — RL agent (Actor-Critic) | ~6,155 |
 | `solver_engine.py` | CVRPEnv — Gymnasium environment wrapping HGS-CVRP | — |
 | `train.py` | PPO training loop, GAE, reward clipping | — |
 | `main.py` | Entry point, smoke tests, CLI | — |
 | `baseline_eval.py` | HGS baseline evaluation (default vs large-pop) | — |
 | `portfolio_solver.py` | Deterministic portfolio baseline (11 configs x N seeds) | — |
 
-**Total trainable parameters: ~5,960.** The model is intentionally lightweight. The heavy lifting is done by HGS-CVRP's C++ solver — our RL agent just learns to steer it effectively.
+**Total trainable parameters: ~6,155.** The model is intentionally lightweight. The heavy lifting is done by HGS-CVRP's C++ solver — our RL agent just learns to steer it effectively.

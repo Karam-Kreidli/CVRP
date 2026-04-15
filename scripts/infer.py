@@ -55,8 +55,8 @@ To plug in a completely different model architecture:
              --model_class MyNewModel --model_path logs/my_model.pth
 
 The new class must have the same forward() signature as FleetManager:
-    forward(instance_features: Tensor[B,7], solver_stats: Tensor[B,7],
-            action_mask: Tensor[B,7] | None) -> (logits: Tensor[B,7], value: Tensor[B,1])
+    forward(instance_features: Tensor[B,12], solver_stats: Tensor[B,7],
+            action_mask: Tensor[B,10] | None) -> (logits: Tensor[B,10], value: Tensor[B,1])
 
 ===========================================================================
 UNDERSTANDING THE OUTPUT
