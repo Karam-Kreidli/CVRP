@@ -1,0 +1,81 @@
+{
+  "meta": {
+    "generated_utc": "2026-04-18T15:57:47.723578+00:00",
+    "model_path": "logs/best_model.pth",
+    "model_class": "FleetManager",
+    "device": "cpu",
+    "num_instances": 59,
+    "instance_scope": "data",
+    "seed": 42,
+    "tie_decimals": 3,
+    "baseline_iters": 25000,
+    "baseline_policy": "single",
+    "baseline_seeds": [
+      42
+    ],
+    "baseline_cache_csv": "logs/final_full_eval_baseline_cache.csv"
+  },
+  "aggregate": {
+    "num_instances": 59,
+    "counts": {
+      "wins": 6,
+      "losses": 42,
+      "ties": 11
+    },
+    "rates_pct": {
+      "wins": 10.169491525423728,
+      "losses": 71.1864406779661,
+      "ties": 18.64406779661017
+    },
+    "scores": {
+      "rl_mean": 70301.7627118644,
+      "bl_mean": 70266.22033898305
+    },
+    "delta": {
+      "mean": 35.54237288135593,
+      "median": 18.0,
+      "min": -991.0,
+      "max": 1097.0
+    },
+    "delta_pct": {
+      "mean": 0.01313802608971206,
+      "median": 0.03249060818357194,
+      "min": -2.7313266443701227,
+      "max": 0.7020126067897482
+    },
+    "pairwise_points": {
+      "rl_total": 495.0,
+      "bl_total": 567.0,
+      "rl_avg_per_instance": 8.389830508474576,
+      "bl_avg_per_instance": 9.610169491525424,
+      "margin_total": -72.0,
+      "margin_avg_per_instance": -1.2203389830508475
+    },
+    "best_case_for_rl": {
+      "instance": "X-n247-k50",
+      "delta": -991.0,
+      "delta_pct": -1.1084267275126949
+    },
+    "worst_case_for_rl": {
+      "instance": "X-n289-k60",
+      "delta": 1097.0,
+      "delta_pct": 0.7020126067897482
+    }
+  },
+  "bootstrap": {
+    "subset_size": 20,
+    "num_trials": 2000,
+    "rng_seed": 123,
+    "prob_rl_beats_baseline_points": 0.0005,
+    "prob_rl_loses_points": 0.9995,
+    "prob_points_tie": 0.0,
+    "expected_points_margin": -24.163,
+    "median_points_margin": -24.0,
+    "p05_points_margin": -34.0,
+    "p95_points_margin": -14.0,
+    "expected_rl_points": 167.9185,
+    "expected_bl_points": 192.0815,
+    "prob_avg_delta_lt_zero": 0.318,
+    "expected_avg_delta": 32.56325
+  }
+}
