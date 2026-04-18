@@ -1,0 +1,87 @@
+{
+  "ppo_config": {
+    "gamma": 0.95,
+    "lam": 0.9,
+    "epsilon_clip": 0.2,
+    "vf_coeff": 0.5,
+    "ent_coeff": 0.02,
+    "manager_lr": 0.0001,
+    "ppo_epochs": 3,
+    "mini_batch_size": 128,
+    "max_grad_norm": 0.5,
+    "use_fp16": false,
+    "target_kl": 0.015,
+    "reward_clip_min": -10.0,
+    "reward_clip_max": 10.0
+  },
+  "eval_instances": [
+    "data/X-n101-k25.vrp",
+    "data/X-n153-k22.vrp",
+    "data/X-n204-k19.vrp",
+    "data/X-n256-k16.vrp",
+    "data/X-n308-k13.vrp"
+  ],
+  "holdout_instances": [
+    "data/X-n106-k14.vrp",
+    "data/X-n157-k13.vrp",
+    "data/X-n209-k16.vrp",
+    "data/X-n261-k13.vrp",
+    "data/X-n313-k71.vrp"
+  ],
+  "holdout_eval_interval": 5,
+  "best_model_metric": "composite",
+  "run_config": {
+    "run_tag": "final_v1_resume_kbi",
+    "cli_args": {
+      "mode": "train",
+      "epochs": 80,
+      "batch_size": 128,
+      "instance_path": "data",
+      "checkpoint_dir": "checkpoints",
+      "save_interval": 10,
+      "episodes_per_epoch": 8,
+      "eval_count": 5,
+      "eval_instances": null,
+      "holdout_count": 5,
+      "holdout_instances": null,
+      "holdout_eval_interval": 5,
+      "best_model_metric": "composite",
+      "gamma": 0.95,
+      "lam": 0.9,
+      "epsilon_clip": 0.2,
+      "vf_coeff": 0.5,
+      "manager_lr": 0.0001,
+      "ppo_epochs": 3,
+      "max_grad_norm": 0.5,
+      "target_kl": 0.015,
+      "reward_clip_min": -10.0,
+      "reward_clip_max": 10.0,
+      "failure_penalty": -5.0,
+      "no_improvement_penalty": -0.5,
+      "fp16": false,
+      "ent_coeff": 0.02,
+      "run_tag": "final_v1_resume_kbi",
+      "log_dir": "logs",
+      "gdrive_path": null,
+      "curriculum_epochs": 20,
+      "resume": "checkpoints/checkpoint_epoch20.pth",
+      "start_epoch": 21
+    },
+    "selected_eval_instances": [
+      "data/X-n101-k25.vrp",
+      "data/X-n153-k22.vrp",
+      "data/X-n204-k19.vrp",
+      "data/X-n256-k16.vrp",
+      "data/X-n308-k13.vrp"
+    ],
+    "selected_holdout_instances": [
+      "data/X-n106-k14.vrp",
+      "data/X-n157-k13.vrp",
+      "data/X-n209-k16.vrp",
+      "data/X-n261-k13.vrp",
+      "data/X-n313-k71.vrp"
+    ],
+    "holdout_eval_interval": 5,
+    "best_model_metric": "composite"
+  }
+}
