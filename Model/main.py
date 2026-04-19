@@ -29,7 +29,7 @@ import torch
 
 def smoke_test_fleet_manager():
     """Verify FleetManager forward pass with 10 actions."""
-    from Source_Code.Agent_Manager import FleetManager, NUM_FLEET_ACTIONS, INSTANCE_FEATURES_DIM, SOLVER_STATS_DIM
+    from Model.Agent_Manager import FleetManager, NUM_FLEET_ACTIONS, INSTANCE_FEATURES_DIM, SOLVER_STATS_DIM
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     manager = FleetManager().to(device)
@@ -58,7 +58,7 @@ def smoke_test_fleet_manager():
 
 def smoke_test_fleet_manager_fp16():
     """Verify FleetManager under AMP on GPU."""
-    from Source_Code.Agent_Manager import FleetManager, NUM_FLEET_ACTIONS, INSTANCE_FEATURES_DIM, SOLVER_STATS_DIM
+    from Model.Agent_Manager import FleetManager, NUM_FLEET_ACTIONS, INSTANCE_FEATURES_DIM, SOLVER_STATS_DIM
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
@@ -82,7 +82,7 @@ def smoke_test_fleet_manager_fp16():
 
 def smoke_test_pipeline():
     """End-to-end: Instance features -> FleetManager on a synthetic observation."""
-    from Source_Code.Agent_Manager import FleetManager, ACTION_NAMES, INSTANCE_FEATURES_DIM, SOLVER_STATS_DIM
+    from Model.Agent_Manager import FleetManager, ACTION_NAMES, INSTANCE_FEATURES_DIM, SOLVER_STATS_DIM
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     manager = FleetManager().to(device)
@@ -101,7 +101,7 @@ def smoke_test_cvrp_env():
     """Stage 3: Run CVRPEnv for one full step on a synthetic .vrp instance."""
     import tempfile
     import os
-    from Source_Code.Solver_Engine import CVRPEnv, ACTION_NAMES, OBS_DIM
+    from Model.Solver_Engine import CVRPEnv, ACTION_NAMES, OBS_DIM
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -179,8 +179,8 @@ def smoke_test_training():
     import tempfile
     import os
     import random as pyrandom
-    from Source_Code.Solver_Engine import CVRPEnv
-    from Source_Code.Train import MARLTrainer, PPOConfig
+    from Model.Solver_Engine import CVRPEnv
+    from Model.Train import MARLTrainer, PPOConfig
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -248,8 +248,8 @@ def smoke_test_action_masking():
     """Verify NV_min calculation and action masking with 10-action space."""
     import tempfile
     import os
-    from Source_Code.Solver_Engine import CVRPEnv, NUM_ACTIONS, INSTANCE_FEATURES_DIM
-    from Source_Code.Agent_Manager import FleetManager
+    from Model.Solver_Engine import CVRPEnv, NUM_ACTIONS, INSTANCE_FEATURES_DIM
+    from Model.Agent_Manager import FleetManager
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -370,8 +370,8 @@ def train(args):
       4. Create the MARLTrainer (PPO training engine)
       5. Run the epoch loop with curriculum learning and checkpointing
     """
-    from Source_Code.Solver_Engine import CVRPEnv
-    from Source_Code.Train import MARLTrainer, PPOConfig
+    from Model.Solver_Engine import CVRPEnv
+    from Model.Train import MARLTrainer, PPOConfig
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")

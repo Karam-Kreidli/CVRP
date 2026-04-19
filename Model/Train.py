@@ -44,8 +44,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
-from Source_Code.Agent_Manager import FleetManager
-from Source_Code.Solver_Engine import CVRPEnv, INSTANCE_FEATURES_DIM
+from Model.Agent_Manager import FleetManager
+from Model.Solver_Engine import CVRPEnv, INSTANCE_FEATURES_DIM
 
 
 # ---------------------------------------------------------------------------
