@@ -1,5 +1,5 @@
 # pip install fastapi uvicorn python-multipart torch torch-geometric numpy gymnasium hygese
-# To run: "python backend.py" or "uvicorn backend:app --port 8080 --reload"
+# To run: "python -m Backend.Backend" or "uvicorn Backend.Backend:app --port 8080"
 # On browser: http://localhost:8080/docs for interactive API docs
 
 import os
@@ -479,4 +479,4 @@ def get_benchmark(job_id: str):
     return job["benchmark_result"]
 
 if __name__ == "__main__":
-    uvicorn.run("backend:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run("Backend.Backend:app", host="0.0.0.0", port=8080, reload=True)
