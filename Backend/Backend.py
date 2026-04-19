@@ -44,7 +44,7 @@ IS_MODEL_LOADED = False
 # Note: We use `map_location=device` so the app doesn't crash if it tries to load a GPU-trained model on a machine that only has a CPU.
 
 # 2. Load the fully trained weights from the Logs directory
-MODEL_PATH = "Logs/Best_Model.pth"
+MODEL_PATH = "logs/best_model.pth"
 
 if os.path.exists(MODEL_PATH):
     try:
