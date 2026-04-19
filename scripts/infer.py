@@ -29,8 +29,8 @@ import torch
 # Allow running from the repo root without installing as a package
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from Source_Code.agent_manager import FleetManager, INSTANCE_FEATURES_DIM, ACTION_NAMES
-from Source_Code.solver_engine import CVRPEnv
+from Source_Code.Agent_Manager import FleetManager, INSTANCE_FEATURES_DIM, ACTION_NAMES
+from Source_Code.Solver_Engine import CVRPEnv
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +147,7 @@ def solve_instance(
 def run_baseline(instance_path: pathlib.Path, nb_iter: int, seed: int = 42) -> dict:
     """Single HGS solve with default parameters - the no-RL baseline."""
     import hygese as hgs
-    from Source_Code.solver_engine import _parse_vrp_file, competition_score
+    from Source_Code.Solver_Engine import _parse_vrp_file, competition_score
 
     data = _parse_vrp_file(instance_path)
     params = hgs.AlgorithmParameters(timeLimit=0.0, nbIter=nb_iter, seed=seed)
