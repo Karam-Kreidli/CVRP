@@ -479,4 +479,4 @@ def get_benchmark(job_id: str):
     return job["benchmark_result"]
 
 if __name__ == "__main__":
-    uvicorn.run("Backend.Backend:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run("Backend.Backend:app", host="0.0.0.0", port=8080, reload=False)
