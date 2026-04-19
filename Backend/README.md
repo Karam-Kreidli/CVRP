@@ -62,7 +62,7 @@ Implemented in `Backend.py`:
 From repository root:
 
 ```bash
-python Backend/Backend.py
+uvicorn Backend.Backend:app --port 8080
 ```
 
 Then open:
