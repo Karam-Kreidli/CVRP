@@ -28,9 +28,9 @@ The system has three main components that work together in a pipeline:
                                                                  (Stage 5)
 ```
 
-### Feature Extraction (`solver_engine.py`)
+### Feature Extraction (`Model/Solver_Engine.py`)
 
-**What it does:** Computes 12 hand-crafted features from a CVRP instance that capture scale, demand structure, and spatial geometry. These replace the previous GNN encoder with deterministic, low-cost signals that are immediately useful to the policy.
+**What it does:** Computes 12 hand-crafted features from a CVRP instance that capture scale, demand structure, and spatial geometry. These replace the previous GNN encoder with low-cost, non-learned signals that are immediately useful to the policy (with stochastic customer subsampling for pairwise-distance terms on large instances).
 
 | # | Feature | Formula | What it captures |
 |---|---|---|---|
@@ -51,7 +51,7 @@ Computed once per instance at episode start, then reused for all 50 steps. Pairw
 
 ---
 
-### Stage 2 — Fleet Manager (`agent_manager.py`)
+### Stage 2 — Fleet Manager (`Model/Agent_Manager.py`)
 
 **What it does:** The RL agent — the "brain" of the system. At each step, it looks at 12 instance features + 7 real-time solver statistics and chooses one of 10 fleet-target strategies.
 
@@ -108,7 +108,7 @@ obs (19) --> Linear(19->64) + ReLU --> Linear(64->64) + ReLU
 
 ---
 
-### Stage 3 — Solver Engine (`solver_engine.py`)
+### Stage 3 — Solver Engine (`Model/Solver_Engine.py`)
 
 **What it does:** The bridge between the RL world and the actual solver. Implements a Gymnasium environment that wraps HGS-CVRP (via the `hygese` Python package).
 
@@ -133,7 +133,7 @@ The Fleet Manager doesn't touch routes directly. It controls two key levers:
 **Reward:**
 ```python
 if fleet_exploded:
-    reward = -5.0                           # NV spiked by >2
+    reward = -5.0                           # NV spiked by >2 or constrained solve failed
 elif cand_score < best_score:
     pct = (best_score - cand_score) / best_score
     reward = pct * 100.0                    # percentage improvement over episode best
@@ -146,11 +146,11 @@ Key properties:
 - **Percentage-based** — normalizes across different instance sizes
 - Small negative for no improvement teaches the agent to avoid wasteful actions
 
-**Safety: Fleet Explosion Detection.** If an aggressive action causes NV to spike by more than 2 vehicles, the bad solution is rejected and a penalty of -5.0 is returned.
+**Safety: Fleet Explosion / Failed-Solve Detection.** If an aggressive action causes NV to spike by more than 2 vehicles, or if the constrained solve fails/infeasible, the candidate is rejected and a penalty of -5.0 is returned.
 
 ---
 
-### Stage 5 — PPO Training Loop (`train.py`)
+### Stage 5 — PPO Training Loop (`Model/Train.py`)
 
 **What it does:** Trains the Fleet Manager using Proximal Policy Optimization (PPO), one of the most popular and stable RL algorithms.
 
@@ -301,7 +301,7 @@ Simple clipping is sufficient — no running statistics or normalization needed.
 Training starts with **easier instances** and gradually introduces harder ones:
 
 - **Epochs 1-20:** Only small instances (N <= 100 customers)
-- **Epochs 21+:** All instances (N up to 1001 customers)
+- **Epochs 21+:** All instances (N up to 400 customers)
 
 **Why?** The agent learns basic strategies (which configurations work when) faster on small, quick-to-solve instances. Once it has these fundamentals, it transfers this knowledge to larger, harder instances.
 
@@ -323,39 +323,51 @@ Each epoch follows this cycle:
 - For each mini-batch: compute policy loss + value loss + entropy bonus, do gradient step
 - Check KL divergence after each mini-epoch, stop early if too large
 
-**Phase 3 — Evaluate (5 fixed instances, greedy action selection)**
+**Phase 3 — Evaluate (fixed eval set + optional holdout, greedy action selection)**
 - No exploration — pure argmax action selection
-- Same 5 instances every epoch for consistent progress tracking
-- Save the model if eval score improves (best model tracking)
+- Same fixed eval instances each epoch for consistent progress tracking (default count = 5)
+- Optional holdout evaluation every N epochs (if configured)
+- Save the model using the selected tracking metric: `eval`, `holdout`, or `composite`
 
 **Key metrics:**
-- **Eval score** (the real metric) — should trend downward over time
+- **Sel[metric]** (the real model-selection metric) — should trend downward over time
+- **Eval score** — fixed-set progress signal (always useful for trend reading)
+- **Holdout score** — out-of-sample signal when holdout is enabled
 - **AvgScore** — noisy because of random instances, mostly ignore
 - **Entropy** — should stay above ~0.5 (agent still exploring)
 - **Policy loss** — small values are normal
 
 ---
 
-## 9. Portfolio Baseline (`scripts/portfolio_solver.py`)
+## 9. Portfolio Baseline (`Baseline/Portfolio_Solver.py`)
 
-A non-RL safety net. Systematically tries **11 HGS parameter configurations x 5 random seeds** per instance, keeping the best result. No learning involved — pure brute-force search over the config space.
+A non-RL safety net. Systematically tries **11 HGS parameter configurations x N random seeds** per instance, keeping the best result. No learning involved — pure brute-force search over the config space.
+
+Current defaults in `Baseline/Portfolio_Solver.py` are `num_seeds=5`, `nb_iter=10000`, and configurable `workers` for parallelism.
+
+`Baseline/Baseline_Evaluation.py` complements this with two reporting modes:
+- Single-solve baseline (fair RL comparison): one default and one large-pop solve per instance.
+- Best-of-N baseline (upper bound): configurable `num_seeds x num_steps` (defaults `3 x 1`) with `nb_iter=25000`.
 
 This guarantees competition-ready solutions regardless of whether RL training succeeds.
 
 ---
 
-## 10. Competition-Oriented Inference Reporting (`scripts/infer.py`)
+## 10. Competition-Oriented Inference Reporting (`Baseline/Infer.py`)
 
-`scripts/infer.py` now supports a competition-facing evaluation mode when `--baseline` is enabled:
+`Baseline/Infer.py` now supports a competition-facing evaluation mode when `--baseline` is enabled:
 
 - Per-instance RL vs baseline rows with tie-aware outcomes (`win/loss/tie`) at **3-decimal score precision**.
 - Pairwise Formula-1 surrogate points per instance: **10** for winner, **8** for second, tie -> **9/9** split.
 - Aggregate summaries: win/loss/tie counts and rates, absolute/relative deltas, and point totals/margins.
 - Hidden-subset robustness simulation via bootstrap sampling (`--subset_size`, `--bootstrap_trials`, `--bootstrap_seed`).
-- Artifact export to `logs/` by default:
-    - `<stem>_instances.csv`
-    - `<stem>_summary.json`
-    - `<stem>_report.md`
+- Artifact export to `Results/` by default:
+    - `<stem>_Instances.csv`
+    - `<stem>_Summary.json`
+    - `<stem>_Report.md`
+- RL route export to `Solutions/HGS+RL/`:
+    - `sol-Format/<instance>.sol`
+    - `txt-Format/<instance>.txt`
 
 Important interpretation note: this points view is a **pairwise RL-vs-baseline surrogate**, not the final multi-competitor competition ranking.
 
@@ -365,12 +377,12 @@ Important interpretation note: this points view is a **pairwise RL-vs-baseline s
 
 | File | Role | Parameters |
 |------|------|-----------|
-| `agent_manager.py` | Fleet Manager — RL agent (Actor-Critic) | ~6,155 |
-| `solver_engine.py` | CVRPEnv — Gymnasium environment wrapping HGS-CVRP | — |
-| `train.py` | PPO training loop, GAE, reward clipping | — |
-| `main.py` | Entry point, smoke tests, CLI | — |
-| `infer.py` | RL inference + baseline comparison + competition-oriented reports | — |
-| `baseline_eval.py` | HGS baseline evaluation (default vs large-pop) | — |
-| `portfolio_solver.py` | Deterministic portfolio baseline (11 configs x N seeds) | — |
+| `Model/Agent_Manager.py` | Fleet Manager — RL agent (Actor-Critic) | ~6,155 |
+| `Model/Solver_Engine.py` | CVRPEnv — Gymnasium environment wrapping HGS-CVRP | — |
+| `Model/Train.py` | PPO training loop, GAE, reward clipping | — |
+| `Model/main.py` | Entry point, smoke tests, CLI | — |
+| `Baseline/Infer.py` | RL inference + baseline comparison + competition-oriented reports | — |
+| `Baseline/Baseline_Evaluation.py` | HGS baseline evaluation (default vs large-pop) | — |
+| `Baseline/Portfolio_Solver.py` | Deterministic portfolio baseline (11 configs x N seeds) | — |
 
 **Total trainable parameters: ~6,155.** The model is intentionally lightweight. The heavy lifting is done by HGS-CVRP's C++ solver — our RL agent just learns to steer it effectively.

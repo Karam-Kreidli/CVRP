@@ -84,7 +84,7 @@ The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance 
 
 ## 3. Component Details
 
-### 3.1 Instance Feature Extraction (`src/solver_engine.py`)
+### 3.1 Instance Feature Extraction (`Model/Solver_Engine.py`)
 
 **Purpose:** Compute a fixed-size feature vector that captures the spatial and structural properties of a CVRP instance. These features let the RL agent distinguish between different types of instances and adapt its strategy accordingly.
 
@@ -127,11 +127,11 @@ The 1000x multiplier on NV means eliminating one vehicle is worth 1000 distance 
 - Computed **once per instance** at the start of each episode, then reused for all 50 steps
 - Pairwise-distance features use all customers for N <= 200 and a 200-customer subsample for larger instances to bound memory/time
 - Features are scaled to stable ranges (mostly [0, 1]) to avoid destabilizing PPO updates
-- No learned parameters — these are deterministic computations
+- No learned parameters — these are hand-crafted computations (with stochastic subsampling for pairwise-distance terms when N > 200)
 
 ---
 
-### 3.2 Fleet Manager (`src/agent_manager.py`)
+### 3.2 Fleet Manager (`Model/Agent_Manager.py`)
 
 **Purpose:** The RL agent. Decides the fleet-target strategy at each step — whether to push for fewer vehicles, lock the current fleet size, or try a new random seed.
 
@@ -197,7 +197,7 @@ action_logits  state_value
 
 ---
 
-### 3.3 HGS-CVRP Solver Engine (`src/solver_engine.py`)
+### 3.3 HGS-CVRP Solver Engine (`Model/Solver_Engine.py`)
 
 **Purpose:** The actual CVRP solver. A high-performance C++ Hybrid Genetic Search engine wrapped as a Gymnasium environment.
 
@@ -252,12 +252,12 @@ Key properties:
 - Small negative for no improvement teaches the agent to avoid wasteful actions
 
 **Safety mechanisms:**
-- **Fleet explosion detection:** If an aggressive action causes NV to spike by >2, the bad solution is rejected and a penalty reward (-5.0) is returned
+- **Fleet explosion / failed-solve detection:** If an aggressive action causes NV to spike by >2, or if the constrained solve fails/infeasible, the candidate is rejected and a penalty reward (-5.0) is returned
 - **Best-of-N tracking:** The environment keeps the best solution found across all steps, so a bad step doesn't lose progress
 
 ---
 
-### 3.4 PPO Training (`src/train.py`)
+### 3.4 PPO Training (`Model/Train.py`)
 
 **Purpose:** Train the Fleet Manager to maximize cumulative reward using Proximal Policy Optimization.
 
@@ -279,8 +279,9 @@ PPO Update (3 mini-epochs):
     - Add entropy bonus (encourages exploration)
     - Early stop if KL divergence too large
 
-Evaluate on 5 fixed instances (greedy, no exploration)
-Save best model based on eval score
+Evaluate on fixed eval instances (greedy, no exploration; default count = 5)
+Optionally evaluate holdout instances every N epochs
+Save best model using selected metric (`eval`, `holdout`, or `composite`)
 ```
 
 **Key hyperparameters:**
@@ -301,7 +302,7 @@ Save best model based on eval score
 
 **Curriculum learning:**
 - Epochs 1-20: Only train on small instances (N <= 100)
-- Epochs 21+: Use all instances (N up to 1001)
+- Epochs 21+: Use all instances (N up to 400)
 
 This helps the agent learn basic strategies on easier problems before tackling harder ones.
 
@@ -357,29 +358,32 @@ This helps the agent learn basic strategies on easier problems before tackling h
 ## 5. File Structure
 
 ```
-src/
-  agent_manager.py   - Fleet Manager RL agent (Stage 2)
-  solver_engine.py   - HGS-CVRP Gymnasium environment (Stage 3)
-  train.py           - PPO training loop (Stage 5)
-  main.py            - Entry point, smoke tests, CLI
+Model/
+  Agent_Manager.py      - Fleet Manager RL agent (Stage 2)
+  Solver_Engine.py      - HGS-CVRP Gymnasium environment (Stage 3)
+  Train.py              - PPO training loop (Stage 5)
+  main.py               - Entry point, smoke tests, CLI
 
-scripts/
-  setup_vm.sh        - Ubuntu GPU VM setup script
-  infer.py           - RL inference + baseline comparison + competition-style report export
-  baseline_eval.py   - HGS baseline evaluation (default vs large-pop)
-  portfolio_solver.py - Deterministic portfolio baseline (11 configs x N seeds)
+Baseline/
+  Infer.py              - RL inference + baseline comparison + report export
+  Baseline_Evaluation.py - HGS baseline evaluation (default vs large-pop)
+  Portfolio_Solver.py   - Deterministic portfolio baseline (11 configs x N seeds)
 
-docs/
-  architecture.md    - System architecture (this file)
-  code.md            - Code explanation
-  benchmark_reference.md - X-dataset BKS scores from Uchoa et al.
+Documents/
+  Architecture.md       - System architecture (this file)
+  Code.md               - Code explanation
+  Benchmark_Reference.md - X-dataset BKS scores from Uchoa et al.
 
-data/                - X-dataset .vrp instance files
-logs/                - Training CSV metrics + best model
-checkpoints/         - Periodic checkpoint .pth files
+Data/                   - X-dataset .vrp instance files
+Logs/                   - Training artifacts (Training_Metrics.csv, Run_Configuration.json, Best_Model.pth)
+Checkpoints/            - Periodic checkpoints (Checkpoint_Epoch*.pth, Checkpoint_Final.pth)
+Solutions/              - HGS and HGS+RL solution exports (sol-Format/ and txt-Format/)
+Results/                - Competition-style evaluation exports from Baseline/Infer.py
+ML4VRP_API_Spec_GH.md   - API specification
+backend.py              - FastAPI runtime service
 ```
 
-`scripts/infer.py` provides the competition-facing evaluation path. With `--baseline`, it now writes structured artifacts in `logs/` (CSV/JSON/Markdown), applies tie handling at 3-decimal score precision, computes pairwise Formula-1 surrogate points (10/8, tie -> 9/9), and reports bootstrap subset robustness. This is intentionally a **head-to-head RL-vs-baseline surrogate**, not a full hidden-leaderboard rank reconstruction.
+`Baseline/Infer.py` provides the competition-facing evaluation path. With `--baseline`, it writes structured artifacts in `Results/` (CSV/JSON/Markdown), applies tie handling at 3-decimal score precision, computes pairwise Formula-1 surrogate points (10/8, tie -> 9/9), and reports bootstrap subset robustness. It also writes RL route files to `Solutions/HGS+RL/sol-Format/` and `Solutions/HGS+RL/txt-Format/`.
 
 ---
 
@@ -393,12 +397,14 @@ When training runs, you'll see output like:
 | Metric | What it means |
 |---|---|
 | AvgScore | Average score across 8 training episodes (noisy due to random instances) |
-| **Eval** | **Score on 5 fixed instances (the real progress metric)** |
+| Eval | Score on the fixed evaluation set |
+| Holdout | Score on the holdout set (if holdout is enabled) |
+| Sel[metric] | Tracking metric used for best-model selection (`eval`, `holdout`, or `composite`) |
 | Ent | Policy entropy (>0.5 = still exploring, 0 = collapsed) |
 | /epoch | Wall-clock time per epoch |
 | ETA | Estimated time remaining |
 
-**What to watch:** The Eval column should trend downward over time. AvgScore will be noisy — ignore it. Entropy should stay above ~0.5. A stagnation warning appears if eval hasn't improved in 15 epochs.
+**What to watch:** `Sel[metric]` should trend downward over time (this is what controls best-model saving). AvgScore is noisy and secondary. Entropy should stay above ~0.5. A stagnation warning appears if the selected tracking metric has not improved for 15 epochs.
 
 ---
 
@@ -406,7 +412,7 @@ When training runs, you'll see output like:
 
 | Component | Parameters | Purpose |
 |---|---|---|
-| Fleet Manager | ~5,960 | Strategy selection |
+| Fleet Manager | ~6,155 | Strategy selection |
 
 The model is intentionally lightweight. The heavy lifting is done by HGS-CVRP's C++ solver — our RL agent just learns to steer it effectively.
 
@@ -419,12 +425,12 @@ The RL agent is compared against baselines:
 | Baseline | Description | How it works |
 |---|---|---|
 | **Single Default** | One HGS solve with default params (seed=42) | Fair comparison — what HGS gets without RL |
-| **Best-of-N** | Multiple seeds x 5 steps, keep best | Upper bound — brute-force repetition |
-| **Portfolio** | 11 configs x 5 seeds, 10k iters each, keep best per instance | Strongest non-RL baseline |
+| **Best-of-N** | Multiple seeds x configurable steps, keep best | Upper bound — brute-force repetition (`Baseline/Baseline_Evaluation.py`; defaults: `num_seeds=3`, `num_steps=1`, `nb_iter=25000`) |
+| **Portfolio** | 11 configs x configurable seeds, keep best per instance | Strongest non-RL baseline (`Baseline/Portfolio_Solver.py`; defaults: `num_seeds=5`, `nb_iter=10000`) |
 
 The RL agent must beat the Single Default baseline to demonstrate that learned parameter tuning adds value over HGS's hand-tuned defaults.
 
-Reference scores from the literature are in `docs/benchmark_reference.md` (Uchoa et al., 2014).
+Reference scores from the literature are in `Documents/Benchmark_Reference.md` (Uchoa et al., 2014).
 
 ---
 
