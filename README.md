@@ -233,7 +233,7 @@ python Baseline/Portfolio_Solver.py \
 ## G) Start API Backend
 
 ```bash
-python Backend/Backend.py
+uvicorn Backend.Backend:app --port 8080
 ```
 
 Then open FastAPI docs in browser:
