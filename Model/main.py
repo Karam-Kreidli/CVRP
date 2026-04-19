@@ -13,10 +13,10 @@ SMOKE TESTS verify each stage of the pipeline independently:
   - Stage 6: Action masking (NV_min calculation and mask enforcement)
 
 Usage:
-    python -m src.main                                    # run all smoke tests
-    python -m src.main train --instance_path data/ --epochs 100
-    python -m src.main train --instance_path data/ --fp16 --gdrive_path /content/drive/MyDrive/ml4vrp
-    python -m src.main train --instance_path data/ --resume checkpoints/checkpoint_epoch10.pth --start_epoch 11
+    python -m Model.main                                    # run all smoke tests
+    python -m Model.main train --instance_path Data/ --epochs 100
+    python -m Model.main train --instance_path Data/ --fp16 --gdrive_path /content/drive/MyDrive/ml4vrp
+    python -m Model.main train --instance_path Data/ --resume Checkpoints/Checkpoint_Epoch10.pth --start_epoch 11
 """
 
 import argparse
@@ -616,13 +616,13 @@ def train(args):
             )
 
         if epoch % args.save_interval == 0:
-            ckpt = checkpoint_dir / f"checkpoint_epoch{epoch}.pth"
+            ckpt = checkpoint_dir / f"Checkpoint_Epoch{epoch}.pth"
             trainer.save_checkpoint(str(ckpt))
             print(f"  Saved: {ckpt}")
             if args.gdrive_path:
                 save_to_gdrive(ckpt, args.gdrive_path)
 
-    final = checkpoint_dir / "checkpoint_final.pth"
+    final = checkpoint_dir / "Checkpoint_Final.pth"
     trainer.save_checkpoint(str(final))
     total_time = time.time() - train_start
     tt_h, tt_rem = divmod(int(total_time), 3600)
@@ -643,7 +643,7 @@ def parse_args():
     tp.add_argument("--batch_size", type=int, default=128)
     tp.add_argument("--instance_path", type=str, required=True,
                      help="Path to .vrp file or directory of .vrp files")
-    tp.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    tp.add_argument("--checkpoint_dir", type=str, default="Checkpoints")
     tp.add_argument("--save_interval", type=int, default=10)
     tp.add_argument("--episodes_per_epoch", type=int, default=8,
                      help="Episodes per epoch (more = stabler gradients)")
@@ -694,7 +694,7 @@ def parse_args():
                      help="Entropy bonus coefficient")
     tp.add_argument("--run_tag", type=str, default="",
                      help="Short run label stored in logs for traceability")
-    tp.add_argument("--log_dir", type=str, default="logs",
+    tp.add_argument("--log_dir", type=str, default="Logs",
                      help="Directory for CSV training metrics")
     tp.add_argument("--gdrive_path", type=str, default=None,
                      help="Google Drive directory for checkpoint backup")

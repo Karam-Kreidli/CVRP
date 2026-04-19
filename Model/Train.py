@@ -315,7 +315,7 @@ class MARLTrainer:
 
         # CSV log for plotting training curves
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.csv_path = self.log_dir / "training_metrics.csv"
+        self.csv_path = self.log_dir / "Training_Metrics.csv"
         self._csv_header_written = False
         self._write_run_config()
 
@@ -329,7 +329,7 @@ class MARLTrainer:
             "best_model_metric": self.best_model_metric,
             "run_config": self.run_config,
         }
-        run_config_path = self.log_dir / "run_config.json"
+        run_config_path = self.log_dir / "Run_Configuration.json"
         run_config_path.write_text(
             json.dumps(payload, indent=2, default=str),
             encoding="utf-8",
@@ -824,7 +824,7 @@ class MARLTrainer:
         # even if later training epochs regress.
         if tracking_score < self.best_score:
             self.best_score = tracking_score
-            best_path = self.log_dir / "best_model.pth"
+            best_path = self.log_dir / "Best_Model.pth"
             self.save_checkpoint(str(best_path))
             if self.gdrive_path:
                 self._push_to_gdrive(best_path)

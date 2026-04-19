@@ -9,7 +9,7 @@ When --baseline is enabled, it also produces competition-oriented reporting:
   - pairwise Formula-1 surrogate points (10/8, tie -> 9/9)
   - aggregate metrics (counts, rates, deltas, points)
   - subset robustness via bootstrap simulation
-  - CSV/JSON/Markdown artifacts in logs/ by default
+    - CSV/JSON/Markdown artifacts in Results/ by default
 """
 
 from __future__ import annotations
@@ -573,8 +573,8 @@ def write_solution_files(
     routes: list,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Write RL routes to both .sol and .txt formats."""
-    sol_dir = output_root / "sol-format"
-    txt_dir = output_root / "txt-format"
+    sol_dir = output_root / "sol-Format"
+    txt_dir = output_root / "txt-Format"
     sol_dir.mkdir(parents=True, exist_ok=True)
     txt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -748,7 +748,7 @@ def main() -> None:
     parser.add_argument(
         "--model_path",
         type=str,
-        default="logs/best_model.pth",
+        default="Logs/Best_Model.pth",
         help="Path to the trained model checkpoint (.pth).",
     )
     parser.add_argument(
@@ -799,7 +799,7 @@ def main() -> None:
     parser.add_argument(
         "--baseline_cache_csv",
         type=str,
-        default="logs/competition_eval_baseline_cache.csv",
+        default="Results/Competition_Eval_Baseline_Cache.csv",
         help="CSV cache path for baseline results.",
     )
     parser.add_argument(
@@ -812,13 +812,13 @@ def main() -> None:
     parser.add_argument(
         "--report_dir",
         type=str,
-        default="logs",
+        default="Results",
         help="Directory where comparison artifacts are written.",
     )
     parser.add_argument(
         "--report_stem",
         type=str,
-        default="competition_eval",
+        default="Competition_Eval",
         help="Output stem for report files.",
     )
     parser.add_argument(
@@ -854,8 +854,8 @@ def main() -> None:
     parser.add_argument(
         "--solution_output_dir",
         type=str,
-        default="solutions/HGS+RL",
-        help="Root directory for RL solution files (sol-format/ and txt-format).",
+        default="Solutions/HGS+RL",
+        help="Root directory for RL solution files (sol-Format/ and txt-Format/).",
     )
     parser.add_argument(
         "--no_solution_files",
@@ -1111,9 +1111,9 @@ def main() -> None:
         if not args.no_reports:
             report_dir = pathlib.Path(args.report_dir)
             report_dir.mkdir(parents=True, exist_ok=True)
-            instances_csv = report_dir / f"{args.report_stem}_instances.csv"
-            summary_json = report_dir / f"{args.report_stem}_summary.json"
-            report_md = report_dir / f"{args.report_stem}_report.md"
+            instances_csv = report_dir / f"{args.report_stem}_Instances.csv"
+            summary_json = report_dir / f"{args.report_stem}_Summary.json"
+            report_md = report_dir / f"{args.report_stem}_Report.md"
 
             meta = {
                 "generated_utc": datetime.now(timezone.utc).isoformat(),
@@ -1152,7 +1152,7 @@ def main() -> None:
             print(
                 "RL solution files written: "
                 f"{solution_files_written} instance(s) -> "
-                f"{solution_output_root / 'sol-format'} and {solution_output_root / 'txt-format'}"
+                f"{solution_output_root / 'sol-Format'} and {solution_output_root / 'txt-Format'}"
             )
     else:
         avg_rl = np.mean(rl_scores)
@@ -1166,7 +1166,7 @@ def main() -> None:
             print(
                 "RL solution files written: "
                 f"{solution_files_written} instance(s) -> "
-                f"{solution_output_root / 'sol-format'} and {solution_output_root / 'txt-format'}"
+                f"{solution_output_root / 'sol-Format'} and {solution_output_root / 'txt-Format'}"
             )
 
 

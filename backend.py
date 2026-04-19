@@ -17,8 +17,8 @@ from fastapi.responses import JSONResponse
 
 import torch
 import hygese as hgs
-from src.agent_manager import FleetManager, INSTANCE_FEATURES_DIM, ACTION_NAMES
-from src.solver_engine import CVRPEnv, _parse_vrp_file
+from Model.Agent_Manager import FleetManager, INSTANCE_FEATURES_DIM, ACTION_NAMES
+from Model.Solver_Engine import CVRPEnv, _parse_vrp_file
 
 # =============================================================================
 # APP SETUP & STATE MANAGEMENT
@@ -40,11 +40,11 @@ fleet_manager = FleetManager().to(device)
 IS_MODEL_LOADED = False
 
 # TODO ACTION REQUIRED HERE POST-TRAINING (Below steps should work, if no major code changes are made to the FleetManager architecture or state dict structure during training. If there are changes, you may need to adjust the loading code accordingly.)
-# Once the model is fully trained and you've saved the best weights to "logs/best_model.pth", uncomment the code block below to load those weights into the Fleet Manager. This will ensure that when you run the app, it uses the trained model for inference instead of random weights. Make sure to test this loading process to confirm that the model is correctly loaded and ready for inference!
+# Once the model is fully trained and you've saved the best weights to "Logs/Best_Model.pth", uncomment the code block below to load those weights into the Fleet Manager. This will ensure that when you run the app, it uses the trained model for inference instead of random weights. Make sure to test this loading process to confirm that the model is correctly loaded and ready for inference!
 # Note: We use `map_location=device` so the app doesn't crash if it tries to load a GPU-trained model on a machine that only has a CPU.
 
-# 2. Load the fully trained weights from the logs directory
-MODEL_PATH = "logs/best_model.pth"
+# 2. Load the fully trained weights from the Logs directory
+MODEL_PATH = "Logs/Best_Model.pth"
 
 if os.path.exists(MODEL_PATH):
     try:

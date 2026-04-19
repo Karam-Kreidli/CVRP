@@ -11,9 +11,9 @@ The portfolio approach works because:
   - Best-of-many eliminates unlucky solver runs
 
 Usage:
-    python scripts/portfolio_solver.py --instance_path data/
-    python scripts/portfolio_solver.py --instance_path data/ --nb_iter 10000 --num_seeds 5
-    python scripts/portfolio_solver.py --instance_path data/ --output_dir solutions/HGS
+    python Baseline/Portfolio_Solver.py --instance_path Data/
+    python Baseline/Portfolio_Solver.py --instance_path Data/ --nb_iter 10000 --num_seeds 5
+    python Baseline/Portfolio_Solver.py --instance_path Data/ --output_dir Solutions/HGS
 """
 
 import argparse
@@ -154,9 +154,9 @@ def solve_one(instance_path: str, config_name: str, config_params: dict,
 
 
 def write_solution_files(output_root: pathlib.Path, instance_name: str, routes: list) -> tuple[pathlib.Path, pathlib.Path]:
-    """Write both .sol and .txt outputs under output_root/{sol-format,txt-format}."""
-    sol_dir = output_root / "sol-format"
-    txt_dir = output_root / "txt-format"
+    """Write both .sol and .txt outputs under output_root/{sol-Format,txt-Format}."""
+    sol_dir = output_root / "sol-Format"
+    txt_dir = output_root / "txt-Format"
     sol_dir.mkdir(parents=True, exist_ok=True)
     txt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -184,8 +184,8 @@ def main():
                         help="HGS iterations per solve")
     parser.add_argument("--num_seeds", type=int, default=5,
                         help="Number of random seeds per config")
-    parser.add_argument("--output_dir", type=str, default="solutions/HGS",
-                        help="Root output directory. Files are written to sol-format/ and txt-format/")
+    parser.add_argument("--output_dir", type=str, default="Solutions/HGS",
+                        help="Root output directory. Files are written to sol-Format/ and txt-Format/")
     parser.add_argument("--workers", type=int, default=4,
                         help="Number of parallel workers")
     args = parser.parse_args()
@@ -265,8 +265,8 @@ def main():
     avg_score = total_score / len(best_per_instance) if best_per_instance else 0
     print(f"{'AVERAGE':<25s} {'':>5s} {'':>10s} {avg_score:>10.0f}")
     print(f"\nTotal time: {elapsed/60:.1f} minutes")
-    print(f"SOL files written to: {(output_root / 'sol-format')}/")
-    print(f"TXT files written to: {(output_root / 'txt-format')}/")
+    print(f"SOL files written to: {(output_root / 'sol-Format')}/")
+    print(f"TXT files written to: {(output_root / 'txt-Format')}/")
 
 
 if __name__ == "__main__":
