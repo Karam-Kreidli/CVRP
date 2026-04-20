@@ -147,7 +147,7 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
         env = CVRPEnv(instance_paths=[vrp_path], device=device)
 
         # env.reset() computes hand-crafted instance features and initial solve
-        obs, info = env.reset()
+        obs, info = env.reset(seed=42)
         
         jobs[job_id]["stage_statuses"]["1"] = "done"
         jobs[job_id]["stage_times_seconds"]["1"] = round(time.time() - start_time, 2)
