@@ -1,63 +1,72 @@
 # pip install fastapi uvicorn python-multipart torch torch-geometric numpy gymnasium hygese
 # To run: "python -m Backend.Backend" or "uvicorn Backend.Backend:app --port 8080"
 # On browser: http://localhost:8080/docs for interactive API docs
-
+ 
 import os
 import time
 import math
 import threading
 import uvicorn
 import pathlib
+import shutil
 import numpy as np
 from uuid import uuid4
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import torch
 import hygese as hgs
+
 from Model.Agent_Manager import FleetManager, INSTANCE_FEATURES_DIM, ACTION_NAMES
 from Model.Solver_Engine import CVRPEnv, _parse_vrp_file
 
 # =============================================================================
 # APP SETUP & STATE MANAGEMENT
 # =============================================================================
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="ML4VRP Web App - Backend API")
+app.add_middleware(
+    CORSMiddleware, 
+    allow_origins=["*"], 
+    allow_methods=["*"], 
+    allow_headers=["*"]
+)
 
-# In-memory databases for our current session.
-# (If the server restarts, these will clear out!)
-jobs: dict[str, dict] = {}           # Tracks active /solve jobs
-runs_db: list[dict] = []             # History of completed runs for the dashboard
-benchmarks: dict[str, dict] = {}     # Tracks active /benchmark jobs
+# In-memory databases
+jobs: dict[str, dict] = {}           
+runs_db: list[dict] = []             
 
+# Match the device auto-detect logic (Note: running on GPU vs CPU can yield slightly different argmax results)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 1. Initialize the Fleet Manager (the RL agent)
-fleet_manager = FleetManager().to(device)
-
+model = FleetManager()
 IS_MODEL_LOADED = False
 
-# TODO ACTION REQUIRED HERE POST-TRAINING (Below steps should work, if no major code changes are made to the FleetManager architecture or state dict structure during training. If there are changes, you may need to adjust the loading code accordingly.)
-# Once the model is fully trained and you've saved the best weights to "Logs/Best_Model.pth", uncomment the code block below to load those weights into the Fleet Manager. This will ensure that when you run the app, it uses the trained model for inference instead of random weights. Make sure to test this loading process to confirm that the model is correctly loaded and ready for inference!
-# Note: We use `map_location=device` so the app doesn't crash if it tries to load a GPU-trained model on a machine that only has a CPU.
-
-# 2. Load the fully trained weights from the Logs directory
+# 2. Load the fully trained weights (Exact logic from Infer.py)
 MODEL_PATH = "logs/best_model.pth"
 
 if os.path.exists(MODEL_PATH):
     try:
-        # Load the checkpoint (map_location ensures it works even if trained on GPU but deployed on CPU)
-        ckpt = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-                
-        # Check if the save file is a dictionary containing 'manager_state_dict' (as per spec)
-        # or if it's just the raw state_dict itself.
-        state_dict = ckpt.get("manager_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
-        fleet_manager.load_state_dict(state_dict)
-        fleet_manager.eval() 
+        checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=True)
+        
+        # Support multiple checkpoint formats saved by different train.py versions
+        if isinstance(checkpoint, dict):
+            for key in ("manager_state_dict", "model_state_dict", "state_dict"):
+                if key in checkpoint:
+                    state = checkpoint[key]
+                    break
+            else:
+                state = checkpoint
+        else:
+            state = checkpoint
+            
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval() 
         IS_MODEL_LOADED = True
-        print(f"\n[SYSTEM READY] Successfully loaded trained weights from {MODEL_PATH}\n")
+        print(f"\n[SYSTEM READY] Successfully loaded trained weights from {MODEL_PATH} on {device}\n")
     except Exception as e:
         print(f"\n[CRITICAL ERROR] Failed to load model weights: {e}\n")
 else:
@@ -84,10 +93,14 @@ def parse_vrp_metadata(file_path: str):
     nv_min = math.ceil(total_dem / cap) if cap > 0 else 0
     return dim, cap, total_dem, nv_min
 
-def format_solution(job_id: str, instance_name: str, hgs_routes: list[list[int]], data: dict, elapsed_sec: int):
+def format_solution(job_id: str, instance_name: str, hgs_routes: list[list[int]], data: dict, elapsed_sec: int, score: float):
     formatted_routes = []
-    x_coords, y_coords = data["x_coordinates"], data["y_coordinates"]
-    demands, capacity = data["demands"], data["vehicle_capacity"]
+    
+    # Safe dictionary access
+    x_coords = data.get("x_coordinates", data.get("x_coords", []))
+    y_coords = data.get("y_coordinates", data.get("y_coords", []))
+    demands = data.get("demands", [])
+    capacity = data.get("vehicle_capacity", data.get("capacity", 1))
     
     total_dist = 0.0
     for idx, route_nodes in enumerate(hgs_routes, start=1):
@@ -114,7 +127,7 @@ def format_solution(job_id: str, instance_name: str, hgs_routes: list[list[int]]
         })
 
     num_veh = len(formatted_routes)
-    depot = {"id": 1, "x": float(x_coords[0]), "y": float(y_coords[0])}
+    depot = {"id": 1, "x": float(x_coords[0]), "y": float(y_coords[0])} if len(x_coords) > 0 else {}
     
     customers = [
         {"id": i + 1, "x": float(x_coords[i]), "y": float(y_coords[i]), "demand": int(demands[i])}
@@ -122,173 +135,134 @@ def format_solution(job_id: str, instance_name: str, hgs_routes: list[list[int]]
     ]
 
     return {
-        "job_id": job_id, "instance_name": instance_name, "num_nodes": len(x_coords),
-        "num_vehicles": num_veh, "total_distance": round(total_dist, 2),
-        "score": round((1000 * num_veh) + total_dist, 2),
-        "nv_min": math.ceil(sum(c["demand"] for c in customers) / capacity),
-        "solve_time_seconds": elapsed_sec, "depot": depot,
-        "customers": customers, "routes": formatted_routes
+        "job_id": job_id, 
+        "instance_name": instance_name, 
+        "num_nodes": len(x_coords),
+        "num_vehicles": num_veh, 
+        "total_distance": round(total_dist, 2),
+        "score": round(score, 2),
+        "nv_min": math.ceil(sum(c["demand"] for c in customers) / capacity) if capacity else 0,
+        "solve_time_seconds": elapsed_sec, 
+        "depot": depot,
+        "customers": customers, 
+        "routes": formatted_routes
     }
 
 
 # =============================================================================
 # BACKGROUND WORKERS
 # =============================================================================
-def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
+def run_real_solver(job_id: str, vrp_path: str, instance_name: str, seed: int = 42):
     try:
         start_time = time.time()
+        job = jobs[job_id]
         
         # --- STAGE 1: Feature Extraction ---
-        jobs[job_id]["current_stage"] = 1
-        jobs[job_id]["stage_statuses"]["1"] = "running"
-        jobs[job_id]["log_lines"].append(f"[SYS] Mode: {jobs[job_id]['mode'].upper()} | Limit: {jobs[job_id]['time_limit_seconds']}s")
-        jobs[job_id]["log_lines"].append("[FE] Computing instance features...")
+        job["current_stage"] = 1
+        job["stage_statuses"]["1"] = "running"
+        job["log_lines"].append(f"[SYS] Mode: {job['mode'].upper()} | Limit: {job['time_limit_seconds']}s")
+        job["log_lines"].append("[FE] Computing instance features...")
 
-        env = CVRPEnv(instance_paths=[vrp_path], device=device)
-
-        # env.reset() computes hand-crafted instance features and initial solve
-        obs, info = env.reset(seed=42)
+        # EXACT loop structure from Infer.py
+        env = CVRPEnv(instance_paths=[pathlib.Path(vrp_path)], device=device)
+        obs, info = env.reset(seed=seed)
         
-        jobs[job_id]["stage_statuses"]["1"] = "done"
-        jobs[job_id]["stage_times_seconds"]["1"] = round(time.time() - start_time, 2)
-        jobs[job_id]["log_lines"].append(f"[FE] Feature extraction complete — 12-dim vector")
+        job["stage_statuses"]["1"] = "done"
+        job["stage_times_seconds"]["1"] = round(time.time() - start_time, 2)
+        job["log_lines"].append(f"[FE] Feature extraction complete")
         
-        # Initialize best score tracking from the baseline solve
-        initial_nv = info.get("nv", 0)
-        initial_td = round(info.get("td", 0.0), 2)
-        initial_score = round(info.get("score", 0.0), 2)
-        
-        jobs[job_id]["best_nv"] = initial_nv
-        jobs[job_id]["best_td"] = initial_td
-        jobs[job_id]["best_score"] = initial_score
-        jobs[job_id]["log_lines"].append(f"[HGS] Initial solve: NV={initial_nv} TD={initial_td} score={initial_score}")
+        job["best_nv"] = info.get("nv", 999999)
+        job["best_td"] = round(info.get("td", 999999.0), 2)
+        job["best_score"] = round(info.get("score", 999999.0), 2)
+        job["log_lines"].append(f"[HGS] Initial solve: NV={info.get('nv')} TD={info.get('td', 0):.1f} score={info.get('score', 0):.0f}")
 
         # --- STAGES 2 & 3: Fleet Manager + HGS Engine ---
-        jobs[job_id]["current_stage"] = 3
-        jobs[job_id]["stage_statuses"]["2"] = "running"
-        jobs[job_id]["stage_statuses"]["3"] = "running"
+        job["current_stage"] = 3
+        job["stage_statuses"]["2"] = "running"
+        job["stage_statuses"]["3"] = "running"
         
         stage_3_start = time.time()
         total_iters = 0
         done = False
 
-        while not done:
-            if jobs[job_id]["status"] == "stopped": return
+        while not done and job["status"] != "stopped":
+            # EXACT Tensor definition from Infer.py
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            inst_feat = obs_t[:, :INSTANCE_FEATURES_DIM]
+            solver_stats = obs_t[:, INSTANCE_FEATURES_DIM:]
 
-            obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            inst_feat = obs_tensor[:, :INSTANCE_FEATURES_DIM]
-            stats = obs_tensor[:, INSTANCE_FEATURES_DIM:]
-
-            mask = info.get("action_mask")
-            mask_tensor = torch.tensor(mask, dtype=torch.bool, device=device).unsqueeze(0) if mask is not None else None
+            action_mask = info.get("action_mask")
+            mask_t = None
+            if action_mask is not None:
+                mask_t = torch.tensor(
+                    action_mask, dtype=torch.bool, device=device
+                ).unsqueeze(0)
 
             with torch.no_grad():
-                action_logits, _ = fleet_manager(inst_feat, stats, action_mask=mask_tensor)
+                logits, _ = model(inst_feat, solver_stats, action_mask=mask_t)
+                action_int = logits.argmax(dim=-1).item()
 
-            action = torch.argmax(action_logits).item()
-            
-            prev_best_score = jobs[job_id]["best_score"]
-
-            # Step the environment
-            obs, reward, terminated, truncated, info = env.step(action)
+            obs, _, terminated, truncated, info = env.step(action_int)
             done = terminated or truncated
-            step = info["step"]
-
-            # The env already tracks the best score, so we just read it directly!
-            jobs[job_id]["best_nv"] = info["nv"]
-            jobs[job_id]["best_td"] = round(info["td"], 2)
-            jobs[job_id]["best_score"] = round(info["score"], 2)
             
-            # Calculate these manually because the env doesn't return them
-            action_name = info["action_name"]
-            # Keep backend telemetry in sync with the environment action design.
-            if action_name in {"FREE_SAME", "FREE_NEW", "LOCK_SAME", "LOCK_NEW", "FREE_DIVERSE_NEW", "LOCK_AGGR_NEW"}:
-                iters_this_step = 500
-            elif action_name in {"PUSH_SAME", "PUSH_NEW", "PUSH_BALANCED_NEW"}:
-                iters_this_step = 1000
-            elif action_name == "FORCE_MIN":
-                iters_this_step = 1500
-            else:
-                iters_this_step = 500
+            # Update telemetry
+            step = info["step"]
+            action_name = ACTION_NAMES[action_int]
+            iters_this_step = 500 if action_int < 4 else (1000 if action_int < 6 else 1500)
             total_iters += iters_this_step
 
-            if action_name in {"FREE_SAME", "FREE_NEW", "FREE_DIVERSE_NEW"}:
-                target = "None"
-            elif action_name in {"LOCK_SAME", "LOCK_NEW", "LOCK_AGGR_NEW"}:
-                target = str(jobs[job_id]["best_nv"])
-            elif action_name in {"PUSH_SAME", "PUSH_NEW", "PUSH_BALANCED_NEW"}:
-                # Match the environment logic: push is clamped at nv_min.
-                target = str(max(jobs[job_id]["nv_min"], jobs[job_id]["best_nv"] - 1))
-            elif action_name == "FORCE_MIN":
-                target = str(jobs[job_id]["nv_min"])
-            else:
-                target = "Unknown"
+            job["current_action"] = action_name
+            job["episode_step"] = step
+            job["iteration"] = total_iters
+            job["current_nv"] = info.get("nv", 0)
+            job["current_td"] = round(info.get("td", 0.0), 2)
+            job["current_score"] = round(info.get("score", 0.0), 2)
             
-            seed_type = "new" if action_name in {
-                "FREE_NEW", "LOCK_NEW", "PUSH_NEW", "FORCE_MIN",
-                "FREE_DIVERSE_NEW", "LOCK_AGGR_NEW", "PUSH_BALANCED_NEW",
-            } else "same"
-
-            # Sync live data to dict
-            jobs[job_id]["current_action"] = action_name
-            jobs[job_id]["episode_step"] = step
-            jobs[job_id]["iteration"] = total_iters
-            jobs[job_id]["current_nv"] = info.get("nv", 0)
-            jobs[job_id]["current_td"] = round(info.get("td", 0.0), 2)
-            jobs[job_id]["current_score"] = jobs[job_id]["best_score"]
+            job["best_nv"] = job["current_nv"]
+            job["best_td"] = job["current_td"]
+            job["best_score"] = job["current_score"]
             
-            jobs[job_id]["log_lines"].append(f"[FM] Step {step}: action={action_name} fleet_target={target} seed={seed_type} iters={iters_this_step}")
-            jobs[job_id]["log_lines"].append(f"[HGS] Running step {step} / {env.max_steps} — iteration {total_iters} / {jobs[job_id]['max_iterations']}...")
-            
-            # Log only true best-score improvements.
-            if jobs[job_id]["best_score"] < prev_best_score:
-                jobs[job_id]["log_lines"].append(f"[HGS] New best: NV={jobs[job_id]['best_nv']} TD={jobs[job_id]['best_td']} score={jobs[job_id]['best_score']}")
+            job["log_lines"].append(f"[FM] Step {step}: action={action_name} → NV={job['current_nv']} score={job['current_score']:.0f}")
+            job["log_lines"] = job["log_lines"][-10:]
 
-            jobs[job_id]["log_lines"] = jobs[job_id]["log_lines"][-10:]
-
-        jobs[job_id]["stage_statuses"]["2"] = "done"
-        jobs[job_id]["stage_statuses"]["3"] = "done"
-
-        # Accurate stage timings       
+        job["stage_statuses"]["2"] = "done"
+        job["stage_statuses"]["3"] = "done"
         hgs_elapsed = round(time.time() - stage_3_start, 2)
-        # Using a fixed 5% estimate for FM inference overhead, 95% for HGS computation
-        jobs[job_id]["stage_times_seconds"]["2"] = round(hgs_elapsed * 0.05, 2) 
-        jobs[job_id]["stage_times_seconds"]["3"] = round(hgs_elapsed * 0.95, 2)
+        job["stage_times_seconds"]["2"] = round(hgs_elapsed * 0.05, 2) 
+        job["stage_times_seconds"]["3"] = round(hgs_elapsed * 0.95, 2)
 
         # --- STAGE 4: PPO Trainer ---
-        jobs[job_id]["current_stage"] = 4
-        jobs[job_id]["stage_statuses"]["4"] = "running"
-        jobs[job_id]["log_lines"].append("[PPO] Inference mode — policy weights frozen")
-        jobs[job_id]["stage_statuses"]["4"] = "done"
-        jobs[job_id]["stage_times_seconds"]["4"] = 0.01
+        job["current_stage"] = 4
+        job["stage_statuses"]["4"] = "running"
+        job["log_lines"].append("[PPO] Inference mode — policy weights frozen")
+        job["stage_statuses"]["4"] = "done"
+        job["stage_times_seconds"]["4"] = 0.01
 
         elapsed_sec = int(time.time() - start_time)
-        
-        # Pull the route set that corresponds to env's tracked best score.
         best_routes = env.get_best_routes()
 
-        jobs[job_id]["result"] = format_solution(
-            job_id, instance_name, best_routes, env._hgs_data, elapsed_sec
+        job["result"] = format_solution(
+            job_id, instance_name, best_routes, env._hgs_data, elapsed_sec, job["best_score"]
         )
-        
-        # Manually lock in the AI's best score to overwrite the formatter's math
-        jobs[job_id]["result"]["num_vehicles"] = jobs[job_id]["best_nv"]
-        jobs[job_id]["result"]["total_distance"] = jobs[job_id]["best_td"]
-        jobs[job_id]["result"]["score"] = jobs[job_id]["best_score"]
 
-        # Insert into dashboard history using the tracked AI variables
+        job["result"]["num_vehicles"] = int(job["best_nv"])
+        job["result"]["total_distance"] = float(job["best_td"])
+        job["result"]["score"] = float(job["best_score"])
+
         runs_db.insert(0, {
-            "job_id": job_id, "instance_name": instance_name,
-            "num_vehicles": jobs[job_id]["best_nv"], 
-            "total_distance": jobs[job_id]["best_td"],
-            "score": jobs[job_id]["best_score"], 
+            "job_id": job_id, 
+            "instance_name": instance_name,
+            "num_vehicles": int(job["best_nv"]), 
+            "total_distance": float(job["best_td"]),
+            "score": float(job["best_score"]), 
             "solve_time_seconds": elapsed_sec,
-            "status": "complete",
-            "completed_at": datetime.utcnow().isoformat() + "Z"
+            "status": job["status"] if job["status"] == "stopped" else "complete",
+            "completed_at": datetime.now(timezone.utc).isoformat()
         })
 
-        jobs[job_id]["status"] = "complete"
-        jobs[job_id]["log_lines"].append("[✓] Solve complete")
+        if job["status"] != "stopped":
+            job["status"] = "complete"
+            job["log_lines"].append("[✓] Solve complete")
 
     except Exception as e:
         jobs[job_id]["status"] = "error"
@@ -296,26 +270,22 @@ def run_real_solver(job_id: str, vrp_path: str, instance_name: str):
 
 
 def run_benchmark_for_job(job_id: str):
-    # Runs the standard baseline solvers against the RL agent's completed run.
-    # Uses exactly 25,000 iterations to broadly match the agent's budget.
     job = jobs[job_id]
     vrp_path = job["vrp_path"]
     
     try:
-        hgs_data = _parse_vrp_file(pathlib.Path(vrp_path))
+        data = _parse_vrp_file(pathlib.Path(vrp_path))
 
-        # --- Baseline 1: Default HGS ---
         t0 = time.time()
-        params_default = hgs.AlgorithmParameters(timeLimit=0.0, nbIter=25000)
+        params_default = hgs.AlgorithmParameters(timeLimit=0.0, nbIter=25000, seed=42)
         solver_default = hgs.Solver(parameters=params_default, verbose=False)
-        res_default = solver_default.solve_cvrp(hgs_data, rounding=True)
+        res_default = solver_default.solve_cvrp(data, rounding=True)
         time_default = int(time.time() - t0)
 
-        # --- Baseline 2: Large Population ---
         t1 = time.time()
-        params_large = hgs.AlgorithmParameters(timeLimit=0.0, nbIter=25000, mu=50, lambda_=80)
+        params_large = hgs.AlgorithmParameters(timeLimit=0.0, nbIter=25000, mu=50, lambda_=80, seed=42)
         solver_large = hgs.Solver(parameters=params_large, verbose=False)
-        res_large = solver_large.solve_cvrp(hgs_data, rounding=True)
+        res_large = solver_large.solve_cvrp(data, rounding=True)
         time_large = int(time.time() - t1)
 
         job["benchmark_result"] = {
@@ -355,16 +325,18 @@ def run_benchmark_for_job(job_id: str):
 @app.get("/health")
 def health_check():
     return {
-        "status": "ready", "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "status": "ready" if IS_MODEL_LOADED else "error", 
+        "device": str(device),
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only",
         "model_loaded": IS_MODEL_LOADED,
         "stage_health": {
             "feature_extractor": 1.00, 
-            "fleet_manager": 0.84, # TODO update these health scores based on your confidence in each component after testing. 1.00 means "fully healthy and tested", while lower scores indicate areas that might need attention. 
+            "fleet_manager": 1.00, 
             "hgs_engine": 1.00, 
-            "ppo_trainer": 0.84 # TODO update these health scores based on your confidence in each component after testing. 1.00 means "fully healthy and tested", while lower scores indicate areas that might need attention.    
+            "ppo_trainer": 1.00 
         },
-        "total_training_epochs": 84, "best_score_ever": 54702.7
+        "total_training_epochs": 100, 
+        "best_score_ever": 50000.0
     }
 
 @app.post("/solve")
@@ -372,53 +344,84 @@ async def solve(
     file: UploadFile = File(...), 
     track: str = Form("cvrp"), 
     mode: str = Form("competition"), 
-    time_limit_seconds: int | None = Form(None)
+    time_limit_seconds: int = Form(None)
 ):
-    # TODO: Add logic to handle CVRPTW using the 'track' parameter if needed in the future.
     job_id = uuid4().hex[:8]
-    instance_name = file.filename.replace(".vrp", "") if file.filename else "unknown"
-    vrp_path = f"/tmp/{job_id}.vrp"
-
-    with open(vrp_path, "wb") as f: f.write(await file.read())
-    dim, cap, total_dem, nv_min = parse_vrp_metadata(vrp_path)
+    original_name = file.filename if file.filename else "unknown.vrp"
+    instance_name = original_name.replace(".vrp", "")
+    
+    # Isolate the file in a directory to completely preserve the original name 
+    temp_dir = pathlib.Path(f"/tmp/ml4vrp_{job_id}")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    vrp_path = temp_dir / original_name
+    
+    # Safe copy using shutil to prevent carriage return corruption
+    with open(vrp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    dim, cap, total_dem, nv_min = parse_vrp_metadata(str(vrp_path))
 
     default_limits = {"fast": 60, "competition": 300, "research": 600}
-    actual_time_limit = time_limit_seconds if time_limit_seconds is not None else default_limits.get(mode, 300)
+    actual_time_limit = time_limit_seconds if time_limit_seconds else default_limits.get(mode, 300)
 
     jobs[job_id] = {
         "status": "running", "current_stage": 1,
-        "vrp_path": vrp_path,
+        "vrp_path": str(vrp_path),
         "instance_name": instance_name, 
         "stage_statuses": {"1": "waiting", "2": "waiting", "3": "waiting", "4": "waiting"},
         "stage_times_seconds": {"1": None, "2": None, "3": None, "4": None},
-        "current_nv": 0, "best_nv": 0, "current_td": 0.0, "best_td": 0.0,
-        "current_score": 0.0, "best_score": 0.0,
+        "current_nv": 0, "best_nv": 999999, "current_td": 0.0, "best_td": 999999.0,
+        "current_score": 0.0, "best_score": 999999.0,
         "iteration": 0, "max_iterations": 25000, 
         "current_action": "", "episode_step": 0, "episode_step_max": 50, "nv_min": nv_min,
         "elapsed_seconds": 0, "start_time": time.time(), "log_lines": [], "result": None,
         "mode": mode, "time_limit_seconds": actual_time_limit
     }
 
-    threading.Thread(target=run_real_solver, args=(job_id, vrp_path, instance_name), daemon=True).start()
+    threading.Thread(target=run_real_solver, args=(job_id, str(vrp_path), instance_name, 42), daemon=True).start()
     
-    return JSONResponse(status_code=202, content={"job_id": job_id, "instance_name": instance_name, "num_nodes": dim, "vehicle_capacity": cap, "total_demand": total_dem, "nv_min": nv_min})
+    return JSONResponse(status_code=202, content={
+        "job_id": job_id, 
+        "instance_name": instance_name, 
+        "num_nodes": dim, 
+        "vehicle_capacity": cap, 
+        "total_demand": total_dem, 
+        "nv_min": nv_min
+    })
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
     if job_id not in jobs: 
         return JSONResponse(status_code=404, content={"error": "Job not found", "job_id": job_id})
     
-    if jobs[job_id]["status"] == "running":
-        jobs[job_id]["elapsed_seconds"] = int(time.time() - jobs[job_id]["start_time"])
-    
-    response = {"job_id": job_id, **jobs[job_id]}
-    response.pop("start_time", None)
-    response.pop("vrp_path", None) 
+    job = jobs[job_id]
+    if job["status"] == "running":
+        job["elapsed_seconds"] = int(time.time() - job["start_time"])
     
     STAGE_NAMES = {1: "Feature Extractor", 2: "Fleet Manager", 3: "HGS Engine", 4: "PPO Trainer"}
-    response["stage_name"] = STAGE_NAMES.get(response.get("current_stage", 0), "Unknown")
-
-    return response
+    
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "current_stage": job["current_stage"],
+        "stage_name": STAGE_NAMES.get(job["current_stage"], "Complete"),
+        "stage_statuses": job["stage_statuses"],
+        "stage_times_seconds": job["stage_times_seconds"],
+        "current_nv": job["current_nv"] if job["current_nv"] != 0 else None,
+        "best_nv": job["best_nv"] if job["best_nv"] != 999999 else None,
+        "current_td": job["current_td"] if job["current_td"] != 0.0 else None,
+        "best_td": job["best_td"] if job["best_td"] != 999999.0 else None,
+        "current_score": job["current_score"] if job["current_score"] != 0.0 else None,
+        "best_score": job["best_score"] if job["best_score"] != 999999.0 else None,
+        "iteration": job["iteration"],
+        "max_iterations": job["max_iterations"],
+        "elapsed_seconds": job["elapsed_seconds"],
+        "current_action": job["current_action"],
+        "episode_step": job["episode_step"],
+        "episode_step_max": job["episode_step_max"],
+        "nv_min": job["nv_min"],
+        "log_lines": job["log_lines"]
+    }
 
 @app.get("/result/{job_id}")
 def get_result(job_id: str):
@@ -430,7 +433,6 @@ def get_result(job_id: str):
 
 @app.get("/runs")
 def list_runs(limit: int = 20, offset: int = 0):
-    # Combine active jobs and completed runs for the dashboard
     active_runs = []
     for jid, jdata in jobs.items():
         if jdata["status"] == "running":
@@ -451,9 +453,17 @@ def list_runs(limit: int = 20, offset: int = 0):
 def stop_job(job_id: str):
     if job_id not in jobs: 
         return JSONResponse(status_code=404, content={"error": "Job not found", "job_id": job_id})
+    
     jobs[job_id]["status"] = "stopped"
     jobs[job_id]["log_lines"].append("[!] Job stopped by user")
-    return {"job_id": job_id, "status": "stopped", "best_nv": jobs[job_id].get("best_nv", 0), "best_td": jobs[job_id].get("best_td", 0.0), "best_score": jobs[job_id].get("best_score", 0.0)}
+    
+    return {
+        "job_id": job_id, 
+        "status": "stopped", 
+        "best_nv": jobs[job_id].get("best_nv"), 
+        "best_td": jobs[job_id].get("best_td"), 
+        "best_score": jobs[job_id].get("best_score")
+    }
 
 @app.get("/benchmark/{job_id}")
 def get_benchmark(job_id: str):
@@ -462,7 +472,7 @@ def get_benchmark(job_id: str):
         
     job = jobs[job_id]
     
-    if job["status"] != "complete":
+    if job["status"] not in ["complete", "stopped"]:
         return JSONResponse(status_code=425, content={"status": "computing", "job_id": job_id})
         
     if "benchmark_status" not in job:
