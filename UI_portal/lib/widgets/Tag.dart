@@ -20,11 +20,11 @@ class Tag extends StatelessWidget {
       ),
       child: Text(
         label,
-        style: GoogleFonts.jetBrainsMono(
-          fontSize: 9,
-          fontWeight: FontWeight.w500,
+        style: GoogleFonts.blinker(
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
           color: color,
-          letterSpacing: 0.08,
+          letterSpacing: 1
         ),
         overflow: TextOverflow.ellipsis,
         textAlign: TextAlign.center,

@@ -1,7 +1,6 @@
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
-import 'package:RouteIQ_UI/screens/solution_screen.dart';
 import 'package:RouteIQ_UI/services/benchmark_service.dart';
 import 'package:RouteIQ_UI/theme/app_colors.dart';
 import 'package:RouteIQ_UI/theme/app_text_styles.dart';
@@ -250,8 +249,9 @@ class _BenchmarkScreenState extends State<BenchmarkScreen> with RouteAware {
     return _BenchCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.center,
+
         children: [
-          SectionLabel(title: 'BENCHMARK LOADING'),
+          Align(alignment: Alignment.centerLeft, child: SectionLabel(title: 'BENCHMARK LOADING')),
           const SizedBox(height: 20),
           const SizedBox(
             width: 32,
@@ -582,23 +582,22 @@ class _ScoreBarChartState extends State<_ScoreBarChart>
   static const _padB = 44.0;
   static const _barFrac = 0.55; // bar width as fraction of slot width
 
-  double _computeTickStep(List<double> values) {
-    const eps = 1e-12;
-    final sorted = [...values]..sort();
-    double? minGap;
+  double _niceTickStep(double rawStep) {
+    if (rawStep <= 0) return 1;
 
-    for (int i = 1; i < sorted.length; i++) {
-      final gap = (sorted[i] - sorted[i - 1]).abs();
-      if (gap <= eps) continue;
-      if (minGap == null || gap < minGap) minGap = gap;
-    }
+    final exponent = (math.log(rawStep) / math.ln10).floor();
+    final magnitude = math.pow(10.0, exponent).toDouble();
+    final normalized = rawStep / magnitude;
 
-    if (minGap == null) {
-      final base = sorted.isEmpty ? 1.0 : math.max(sorted.first.abs(), 1.0);
-      return base * 0.01;
-    }
+    final niceNormalized = normalized <= 1
+        ? 1
+        : normalized <= 2
+        ? 2
+        : normalized <= 5
+        ? 5
+        : 10;
 
-    return double.parse(minGap.toStringAsPrecision(10));
+    return niceNormalized * magnitude;
   }
 
   int _decimalsForStep(double step) {
@@ -654,16 +653,20 @@ class _ScoreBarChartState extends State<_ScoreBarChart>
     final scores = entries.map((e) => e.score).toList();
     final rawMax = scores.reduce(math.max);
     final rawMin = scores.reduce(math.min);
-    final yTickStep = _computeTickStep(scores);
+    final range = (rawMax - rawMin).abs();
+    final targetTickCount = 4.0;
+    final baseStep = range == 0 ? math.max(rawMax.abs() * 0.1, 1.0) : range / targetTickCount;
+    final yTickStep = _niceTickStep(baseStep);
     final yLabelDecimals = _decimalsForStep(yTickStep);
 
-    final chartMin = (rawMin / yTickStep).floor() * yTickStep;
+    var chartMin = (rawMin / yTickStep).floor() * yTickStep;
     var chartMax = (rawMax / yTickStep).ceil() * yTickStep;
-    if ((chartMax - rawMax).abs() < 1e-10) {
-      chartMax += yTickStep;
-    }
     if (chartMax <= chartMin) {
       chartMax = chartMin + yTickStep;
+    }
+    if ((chartMax - chartMin) < yTickStep * 2) {
+      chartMin -= yTickStep;
+      chartMax += yTickStep;
     }
 
     return AnimatedBuilder(
@@ -781,43 +784,11 @@ class _ScoreBarChartState extends State<_ScoreBarChart>
         child: Center(
           child: Text(
             label,
-            style: GoogleFonts.jetBrainsMono(
+            style: GoogleFonts.blinker(
               fontSize: 10,
-              fontWeight: hovered ? FontWeight.w700 : FontWeight.w500,
+              fontWeight: hovered ? FontWeight.w600 : FontWeight.w400,
               color: hovered ? e.color : AppColors.textSecondary,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ── Improvement badge ─────────────────────────────────────────────────────
-
-  Widget _buildImprovementBadge(_BarEntry e, Rect bar) {
-    return Positioned(
-      left: bar.left - 10,
-      top: bar.top - 50,
-      width: bar.width + 20,
-      child: AnimatedOpacity(
-        opacity: (_fadeAnim.value * 2).clamp(0.0, 1.0),
-        duration: const Duration(milliseconds: 200),
-        child: Center(
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 3),
-            decoration: BoxDecoration(
-              color: AppColors.green.withOpacity(0.13),
-              border: Border.all(color: AppColors.green.withOpacity(0.45)),
-              borderRadius: BorderRadius.circular(4),
-            ),
-            child: Text(
-              '↓${e.improvementPct!.toStringAsFixed(1)}%',
-              style: GoogleFonts.jetBrainsMono(
-                fontSize: 9,
-                fontWeight: FontWeight.w700,
-                color: AppColors.green,
-              ),
-              textAlign: TextAlign.center,
+              letterSpacing: 1
             ),
           ),
         ),
@@ -841,15 +812,16 @@ class _ScoreBarChartState extends State<_ScoreBarChart>
             Container(
               width: 1,
               height: 5,
-              color: e.color.withOpacity(0.5),
+              color: e.color,
               margin: const EdgeInsets.only(bottom: 3),
             ),
             Text(
-              e.name.replaceAll('RouteIQ ', 'RL\n').replaceAll('HGS ', 'HGS\n'),
+              e.name.replaceAll('RouteIQ ', 'RouteIQ\n').replaceAll('HGS ', 'HGS\n'),
               style: AppTextStyles.monoLabel.copyWith(
                 fontSize: 8,
-                color: hovered ? e.color : AppColors.textSecondary,
+                color: hovered ? e.color : AppColors.textPrimary,
                 fontWeight: hovered ? FontWeight.w700 : FontWeight.w400,
+                letterSpacing: 1
               ),
               textAlign: TextAlign.center,
               maxLines: 2,
@@ -860,39 +832,6 @@ class _ScoreBarChartState extends State<_ScoreBarChart>
     );
   }
 
-  // ── Hover tooltip ─────────────────────────────────────────────────────────
-
-  Widget _buildTooltip(_BarEntry e, Rect bar, double totalW) {
-    final label = _formatLikeTable(e.score);
-    final left = (bar.center.dx - 36).clamp(0.0, totalW - 72);
-    return Positioned(
-      left: left,
-      top: bar.top - 46,
-      child: AnimatedOpacity(
-        opacity: _fadeAnim.value.clamp(0.0, 1.0),
-        duration: const Duration(milliseconds: 120),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-          decoration: BoxDecoration(
-            color: AppColors.bg3,
-            border: Border.all(color: e.color.withOpacity(0.6)),
-            borderRadius: BorderRadius.circular(5),
-            boxShadow: [
-              BoxShadow(color: e.color.withOpacity(0.15), blurRadius: 8),
-            ],
-          ),
-          child: Text(
-            label,
-            style: GoogleFonts.jetBrainsMono(
-              fontSize: 10,
-              fontWeight: FontWeight.w700,
-              color: e.color,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
 }
 
 // ─── BAR CHART: GRID PAINTER ─────────────────────────────────────────────────
@@ -917,12 +856,13 @@ class _BarChartGridPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final gridPaint = Paint()
-      ..color = AppColors.border.withOpacity(0.45)
+      ..color = AppColors.border
       ..strokeWidth = 0.5;
 
-    final labelStyle = GoogleFonts.jetBrainsMono(
+    final labelStyle = GoogleFonts.blinker(
       fontSize: 9,
-      color: AppColors.textMuted,
+      color: AppColors.textPrimary,
+      letterSpacing: 1
     );
 
     final range = chartMax - chartMin;
@@ -949,7 +889,7 @@ class _BarChartGridPainter extends CustomPainter {
       Offset(padL, padT),
       Offset(padL, size.height - padB),
       Paint()
-        ..color = AppColors.border.withOpacity(0.6)
+        ..color = AppColors.border
         ..strokeWidth = 1,
     );
   }
@@ -992,18 +932,11 @@ class _BarChartBarsPainter extends CustomPainter {
         topRight: const Radius.circular(4),
       );
 
-      // Bar fill with vertical gradient
+      // Bar fill with a single solid color
       canvas.drawRRect(
         rr,
         Paint()
-          ..shader = ui.Gradient.linear(
-            Offset(rect.left, rect.top),
-            Offset(rect.left, rect.bottom),
-            [
-              e.color.withOpacity(hovered ? 0.85 : 0.70),
-              e.color.withOpacity(hovered ? 0.45 : 0.28),
-            ],
-          ),
+          ..color = e.color.withOpacity(hovered ? 0.9 : 0.78),
       );
 
       // Border / glow on hover
@@ -1083,7 +1016,7 @@ class _BenchKpiCardState extends State<_BenchKpiCard> {
       onEnter: (_) => setState(() => _hovered = true),
       onExit: (_) => setState(() => _hovered = false),
       child: AnimatedContainer(
-        height: 140,
+        height: 160,
         duration: const Duration(milliseconds: 180),
         padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
         decoration: BoxDecoration(
@@ -1109,7 +1042,7 @@ class _BenchKpiCardState extends State<_BenchKpiCard> {
             const SizedBox(height: 4),
             Text(
               widget.sub,
-              style: AppTextStyles.monoSmall,
+              style: AppTextStyles.monoLabel,
               overflow: TextOverflow.ellipsis,
             ),
             if (widget.tag != null) ...[
@@ -1148,7 +1081,7 @@ class _TableRow extends StatelessWidget {
       children: [
         Container(
           margin: EdgeInsets.only(bottom: 6, top: isBest ? 6 : 0),
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+          padding:  EdgeInsets.symmetric(horizontal: 10, vertical: isHeader ? 0 : 10),
           decoration: BoxDecoration(
             color: isHeader
                 ? Colors.transparent
@@ -1187,7 +1120,7 @@ class _TableRow extends StatelessWidget {
                 child: Text(
                   cell,
                   style: isHeader
-                      ? AppTextStyles.monoLabel.copyWith(fontSize: 9)
+                      ? AppTextStyles.monoLabel.copyWith(fontSize: 11)
                       : AppTextStyles.monoSmall.copyWith(
                           color: fwColor,
                           fontWeight: fw,
@@ -1247,14 +1180,12 @@ class _OutlineButton extends StatefulWidget {
   final IconData icon;
   final Color color;
   final VoidCallback? onTap;
-  final bool fullWidth;
 
   const _OutlineButton({
     required this.label,
     required this.icon,
     required this.color,
     this.onTap,
-    this.fullWidth = false,
   });
 
   @override
@@ -1276,7 +1207,7 @@ class _OutlineButtonState extends State<_OutlineButton> {
         onTap: widget.onTap,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 150),
-          width: widget.fullWidth ? double.infinity : null,
+          width: null,
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
           decoration: BoxDecoration(
             color: _hovered && widget.onTap != null
@@ -1290,9 +1221,7 @@ class _OutlineButtonState extends State<_OutlineButton> {
             borderRadius: BorderRadius.circular(8),
           ),
           child: Row(
-            mainAxisSize: widget.fullWidth
-                ? MainAxisSize.max
-                : MainAxisSize.min,
+            mainAxisSize: MainAxisSize.min,
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Icon(
@@ -1305,10 +1234,10 @@ class _OutlineButtonState extends State<_OutlineButton> {
               const SizedBox(width: 8),
               Text(
                 widget.label,
-                style: GoogleFonts.syne(
+                style: GoogleFonts.blinker(
                   fontSize: 12,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 0.06,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 1,
                   color: widget.onTap == null
                       ? AppColors.textMuted
                       : widget.color,
@@ -1318,36 +1247,6 @@ class _OutlineButtonState extends State<_OutlineButton> {
           ),
         ),
       ),
-    );
-  }
-}
-
-// ── Legend Dot ────────────────────────────────────────────────────────────────
-
-class _LegendDot extends StatelessWidget {
-  final Color color;
-  final String label;
-  const _LegendDot({required this.color, required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          width: 8,
-          height: 8,
-          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-        ),
-        const SizedBox(width: 5),
-        Text(
-          label,
-          style: AppTextStyles.monoSmall.copyWith(
-            color: AppColors.textSecondary,
-            fontSize: 10,
-          ),
-        ),
-      ],
     );
   }
 }
@@ -1370,11 +1269,11 @@ class _InlineTag extends StatelessWidget {
       ),
       child: Text(
         label,
-        style: GoogleFonts.jetBrainsMono(
+        style: GoogleFonts.blinker(
           fontSize: 9,
-          fontWeight: FontWeight.w500,
+          fontWeight: FontWeight.w600,
           color: color,
-          letterSpacing: 0.08,
+          letterSpacing: 1,
         ),
       ),
     );

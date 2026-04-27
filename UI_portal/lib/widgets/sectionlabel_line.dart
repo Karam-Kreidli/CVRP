@@ -9,6 +9,7 @@ class SectionLabel extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       mainAxisSize: MainAxisSize.min,
+      mainAxisAlignment: MainAxisAlignment.start,
       children: [
         Container(width: 16, height: 1, color: AppColors.textMuted),
         const SizedBox(width: 8),
@@ -18,9 +19,9 @@ class SectionLabel extends StatelessWidget {
           overflow: TextOverflow.ellipsis,
         ),
         const SizedBox(width: 8),
-        Flexible(
-          child: Container(height: 1, color: AppColors.textMuted),
-        ),
+        // Flexible(
+        //   child: Container(height: 1, color: AppColors.textMuted),
+        // ),
       ],
     );
   }

@@ -328,19 +328,20 @@ class _AppShellState extends State<_AppShell> {
                         children: [
                           TextSpan(
                             text: 'SOLVE COMPLETE',
-                            style: GoogleFonts.syne(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w700,
+                            style: GoogleFonts.blinker(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
                               color: AppColors.green,
-                              letterSpacing: 0.5,
+                              letterSpacing: 1,
                             ),
                           ),
                           TextSpan(
                             text: '  —  ready to view results',
-                            style: GoogleFonts.jetBrainsMono(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w400,
+                            style: GoogleFonts.blinker(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
                               color: AppColors.textSecondary,
+                              letterSpacing: 1
                             ),
                           ),
                         ],
@@ -374,10 +375,11 @@ class _AppShellState extends State<_AppShell> {
                         ),
                         child: Text(
                           'View',
-                          style: GoogleFonts.syne(
+                          style: GoogleFonts.blinker(
                             fontSize: 12,
                             fontWeight: FontWeight.w700,
                             color: AppColors.green,
+                            letterSpacing: 1,
                           ),
                         ),
                       ),

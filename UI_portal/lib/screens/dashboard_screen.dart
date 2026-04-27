@@ -3,18 +3,15 @@ import 'package:RouteIQ_UI/theme/app_colors.dart';
 import 'package:RouteIQ_UI/theme/app_text_styles.dart';
 import 'package:RouteIQ_UI/utils/api_config.dart';
 import 'package:RouteIQ_UI/utils/app_shell.dart';
-import 'package:RouteIQ_UI/utils/http_utils.dart';
-import 'package:RouteIQ_UI/utils/logger.dart';
 import 'package:RouteIQ_UI/widgets/Tag.dart';
 import 'package:RouteIQ_UI/widgets/animatedDot.dart';
 import 'package:RouteIQ_UI/widgets/sectionlabel_line.dart';
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math' show min;
+import 'dart:math' show ln10, log, min, pow;
 import 'package:http/http.dart' as http;
 
 // ─── API ─────────────────────────────────────────────────────────────────────
@@ -158,7 +155,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   // ── Internal ──────────────────────────────────────────────────────────────
   Timer? _refreshTimer;
-  bool _hasFetchedOnce = false;
 
   @override
   void initState() {
@@ -218,7 +214,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _runs = const [];
       _trendPoints = _kZeroTrend;
       _stages = _emptyStages();
-      _hasFetchedOnce = false;
     });
   }
 
@@ -274,7 +269,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ? _fmtInt(allScore.reduce(min).toInt())
               : _kDash;
           if (trendScores.isNotEmpty) _trendPoints = trendScores;
-          _hasFetchedOnce = true;
         });
       } catch (_) {}
     }
@@ -666,22 +660,27 @@ class _KpiCardState extends State<_KpiCard> {
             ),
             const SizedBox(height: 8),
             Flexible(
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  Flexible(
-                    child: FittedBox(
-                      fit: BoxFit.scaleDown,
-                      alignment: Alignment.bottomLeft,
-                      child: Text(
-                        widget.value,
-                        style: AppTextStyles.kpiValue(displayColor),
-                      ),
+              child: Align(
+                alignment: Alignment.bottomLeft,
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.bottomLeft,
+                  child: RichText(
+                    text: TextSpan(
+                      children: [
+                        TextSpan(
+                          text: widget.value,
+                          style: AppTextStyles.kpiValue(displayColor),
+                        ),
+                        const TextSpan(text: ' '),
+                        TextSpan(
+                          text: ' ${widget.unit}',
+                          style: AppTextStyles.kpiUnit,
+                        ),
+                      ],
                     ),
                   ),
-                  const SizedBox(width: 6),
-                  Text(widget.unit, style: AppTextStyles.kpiUnit),
-                ],
+                ),
               ),
             ),
             const SizedBox(height: 4),
@@ -698,6 +697,26 @@ class _ScoreTrendChart extends StatelessWidget {
   final List<double> points;
   final bool isReady;
   const _ScoreTrendChart({required this.points, required this.isReady});
+
+  // Returns a readable Y-axis step (1, 2, 5, 10, 20, 50, ...).
+  double _niceStep(double rawStep) {
+    if (rawStep <= 0) return 1;
+    final exponent = (log(rawStep) / ln10).floor();
+    final magnitude = pow(10.0, exponent).toDouble();
+    final normalized = rawStep / magnitude;
+
+    double niceNormalized;
+    if (normalized <= 1) {
+      niceNormalized = 1;
+    } else if (normalized <= 2) {
+      niceNormalized = 2;
+    } else if (normalized <= 5) {
+      niceNormalized = 5;
+    } else {
+      niceNormalized = 10;
+    }
+    return niceNormalized * magnitude;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -721,15 +740,15 @@ class _ScoreTrendChart extends StatelessWidget {
 
     final rawMin = points.reduce(min);
     final rawMax = points.reduce((a, b) => a > b ? a : b);
-    final double minY;
-    final double maxY;
-    if (rawMin == rawMax) {
-      minY = 0;
-      maxY = 100;
-    } else {
-      minY = (rawMin * 0.9).floorToDouble();
-      maxY = (rawMax * 1.1).ceilToDouble();
-    }
+
+    // Build stable, rounded Y-axis bounds and interval.
+    const targetTickCount = 5.0;
+    final range = (rawMax - rawMin).abs();
+    final paddedRange = range == 0 ? (rawMax.abs().clamp(10, double.infinity)) : range * 1.2;
+    final yInterval = _niceStep(paddedRange / targetTickCount);
+
+    final minY = ((rawMin - yInterval * 0.5) / yInterval).floor() * yInterval;
+    final maxY = ((rawMax + yInterval * 0.5) / yInterval).ceil() * yInterval;
 
     final lineColor = isReady ? AppColors.cyan : AppColors.textMuted;
 
@@ -749,7 +768,8 @@ class _ScoreTrendChart extends StatelessWidget {
             leftTitles: AxisTitles(
               sideTitles: SideTitles(
                 showTitles: true,
-                reservedSize: 40,
+                reservedSize: 60,
+                interval: yInterval,
                 getTitlesWidget: (v, _) =>
                     Text(v.toInt().toString(), style: AppTextStyles.monoSmall),
               ),
@@ -762,7 +782,7 @@ class _ScoreTrendChart extends StatelessWidget {
                 getTitlesWidget: (v, _) => Padding(
                   padding: const EdgeInsets.only(top: 8),
                   child: Text(
-                    v.toInt().toString(),
+                    (v.toInt() + 1).toString(),
                     style: AppTextStyles.monoSmall,
                   ),
                 ),
@@ -800,7 +820,7 @@ class _ScoreTrendChart extends StatelessWidget {
                   begin: Alignment.topCenter,
                   end: Alignment.bottomCenter,
                   colors: [
-                    lineColor.withOpacity(0.15),
+                    lineColor.withOpacity(0.0),
                     lineColor.withOpacity(0.0),
                   ],
                 ),
@@ -972,7 +992,7 @@ class _TableRowState extends State<_TableRow> {
               child: Text(
                 r.time,
                 style: AppTextStyles.tableCell.copyWith(
-                  color: AppColors.textMuted,
+                  color: AppColors.textSecondary,
                 ),
                 overflow: TextOverflow.ellipsis,
               ),

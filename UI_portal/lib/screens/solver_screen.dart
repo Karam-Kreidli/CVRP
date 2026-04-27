@@ -215,19 +215,20 @@ class _SolverScreenState extends State<SolverScreen> {
                         children: [
                           TextSpan(
                             text: 'SOLVE COMPLETE',
-                            style: GoogleFonts.syne(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w700,
+                            style: GoogleFonts.blinker(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
                               color: AppColors.green,
-                              letterSpacing: 0.5,
+                              letterSpacing: 1,
                             ),
                           ),
                           TextSpan(
                             text: '  —  showing solution in',
-                            style: GoogleFonts.jetBrainsMono(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w400,
+                            style: GoogleFonts.blinker(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
                               color: AppColors.textSecondary,
+                              letterSpacing: 1
                             ),
                           ),
                         ],
@@ -251,10 +252,11 @@ class _SolverScreenState extends State<SolverScreen> {
                     child: Center(
                       child: Text(
                         '$_countdownRemaining',
-                        style: GoogleFonts.syne(
+                        style: GoogleFonts.blinker(
                           fontSize: 13,
-                          fontWeight: FontWeight.w800,
+                          fontWeight: FontWeight.w700,
                           color: AppColors.green,
+                          letterSpacing: 1
                         ),
                       ),
                     ),
@@ -652,27 +654,27 @@ class _SolverScreenState extends State<SolverScreen> {
                 Row(
                   children: [
                     if (m.currentAction.isNotEmpty)
-                      Container(
-                        margin: const EdgeInsets.only(right: 8),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: AppColors.amber.withOpacity(0.12),
-                          border: Border.all(
-                            color: AppColors.amber.withOpacity(0.4),
-                          ),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: Text(
-                          m.currentAction,
-                          style: AppTextStyles.monoSmall.copyWith(
-                            color: AppColors.amber,
-                            fontSize: 9,
-                          ),
-                        ),
-                      ),
+                      // Container(
+                      //   margin: const EdgeInsets.only(right: 8),
+                      //   padding: const EdgeInsets.symmetric(
+                      //     horizontal: 6,
+                      //     vertical: 2,
+                      //   ),
+                      //   decoration: BoxDecoration(
+                      //     color: AppColors.amber.withOpacity(0.12),
+                      //     border: Border.all(
+                      //       color: AppColors.amber.withOpacity(0.4),
+                      //     ),
+                      //     borderRadius: BorderRadius.circular(4),
+                      //   ),
+                      //   // child: Text(
+                      //   //   m.currentAction,
+                      //   //   style: AppTextStyles.monoSmall.copyWith(
+                      //   //     color: AppColors.amber,
+                      //   //     fontSize: 9,
+                      //   //   ),
+                      //   // ),
+                      // ),
                     Text(
                       '${m.episodeStep} / ${m.episodeStepMax}',
                       style: AppTextStyles.monoSmall.copyWith(
@@ -733,7 +735,7 @@ class _SolverScreenState extends State<SolverScreen> {
         crossAxisCount: 2,
         crossAxisSpacing: 10,
         mainAxisSpacing: 10,
-        childAspectRatio: 2.0,
+        childAspectRatio: 4,
         shrinkWrap: true,
         physics: const NeverScrollableScrollPhysics(),
         children: [
@@ -741,31 +743,37 @@ class _SolverScreenState extends State<SolverScreen> {
             label: 'Current NV',
             value: m.currentNv > 0 ? m.currentNv.toString() : '—',
             color: AppColors.cyan,
+            compact: true,
           ),
           _MetricTile(
             label: 'Best NV',
             value: m.bestNv > 0 ? m.bestNv.toString() : '—',
             color: AppColors.green,
+            compact: true,
           ),
           _MetricTile(
             label: 'Current TD',
             value: m.currentTd > 0 ? m.currentTd.toStringAsFixed(1) : '—',
             color: AppColors.amber,
+            compact: true,
           ),
           _MetricTile(
             label: 'Best TD',
             value: m.bestTd > 0 ? m.bestTd.toStringAsFixed(1) : '—',
             color: AppColors.green,
+            compact: true,
           ),
           _MetricTile(
             label: 'Current Score',
             value: m.currentScore > 0 ? _fmtInt(m.currentScore.round()) : '—',
             color: AppColors.textPrimary,
+            compact: true,
           ),
           _MetricTile(
             label: 'Best Score',
             value: m.bestScore > 0 ? _fmtInt(m.bestScore.round()) : '—',
             color: AppColors.green,
+            compact: true,
           ),
         ],
       ),
@@ -967,7 +975,7 @@ class _PipelineStageRowState extends State<_PipelineStageRow>
                 ),
                 Text(
                   s.model,
-                  style: AppTextStyles.monoSmall.copyWith(fontSize: 9),
+                  style: AppTextStyles.monoSmall.copyWith(fontSize: 10),
                 ),
               ],
             ),
@@ -983,7 +991,7 @@ class _PipelineStageRowState extends State<_PipelineStageRow>
                 s.elapsedSeconds != null
                     ? '${s.elapsedSeconds!.toStringAsFixed(1)}s'
                     : '—',
-                style: AppTextStyles.monoSmall.copyWith(fontSize: 9),
+                style: AppTextStyles.monoSmall.copyWith(fontSize: 10),
               ),
             ],
           ),
@@ -1052,9 +1060,13 @@ class _SectionCard extends StatelessWidget {
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.center,
+        mainAxisAlignment: MainAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          SectionLabel(title: title),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: SectionLabel(title: title),
+          ),
           const SizedBox(height: 14),
           child,
         ],
@@ -1080,7 +1092,7 @@ class _InfoTile extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Text(label, style: AppTextStyles.monoLabel.copyWith(fontSize: 9)),
+          Text(label, style: AppTextStyles.monoLabel.copyWith(fontSize: 13)), //customer
           const SizedBox(height: 3),
           Text(
             value,
@@ -1099,16 +1111,22 @@ class _MetricTile extends StatelessWidget {
   final String label;
   final String value;
   final Color color;
+  final bool compact;
   const _MetricTile({
     required this.label,
     required this.value,
     required this.color,
+    this.compact = false,
   });
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      padding: EdgeInsets.symmetric(
+        horizontal: compact ? 10 : 12,
+        vertical: compact ? 8 : 10,
+      ),
+      height: compact ? 82 : 100,
       decoration: BoxDecoration(
         color: AppColors.bg3,
         borderRadius: BorderRadius.circular(6),
@@ -1117,15 +1135,19 @@ class _MetricTile extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Text(label, style: AppTextStyles.monoLabel.copyWith(fontSize: 9)),
-          const SizedBox(height: 4),
+          Text(
+            label,
+            style: AppTextStyles.monoSmall.copyWith(
+              fontSize: compact ? 11 : 12,
+            ),
+          ),
+          SizedBox(height: compact ? 2 : 4),
           Text(
             value,
-            style: GoogleFonts.syne(
-              fontSize: 20,
+            style: GoogleFonts.blinker(
+              fontSize: compact ? 17 : 20,
               fontWeight: FontWeight.w700,
               color: color,
-              height: 1.0,
             ),
           ),
         ],
@@ -1186,16 +1208,16 @@ class _HoverButtonState extends State<_HoverButton> {
               children: [
                 Icon(
                   widget.icon,
-                  size: 16,
+                  size: 18,
                   color: disabled ? AppColors.textMuted : widget.color,
                 ),
                 const SizedBox(width: 8),
                 Text(
                   widget.label,
-                  style: GoogleFonts.syne(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.08,
+                  style: GoogleFonts.blinker(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 1,
                     color: disabled ? AppColors.textMuted : widget.color,
                   ),
                 ),

@@ -5,94 +5,96 @@ import 'app_colors.dart';
 class AppTextStyles {
   AppTextStyles._();
 
-  // ── Display / Headings  (Syne) ────────────────────────────────────────────
-  static TextStyle get displayLarge => GoogleFonts.syne(
+  // ── Display / Headings  (Google Sans) ───────────────────────────────────────
+  static TextStyle get displayLarge => GoogleFonts.blinker(
     fontSize: 28,
-    fontWeight: FontWeight.w800,
-    color: AppColors.textPrimary,
-    letterSpacing: 0.2,
-  );
-
-  static TextStyle get displayMedium => GoogleFonts.syne(
-    fontSize: 24,
-    fontWeight: FontWeight.w800,
-    color: AppColors.textPrimary,
-  );
-
-  static TextStyle get heading => GoogleFonts.syne(
-    fontSize: 15,
     fontWeight: FontWeight.w700,
     color: AppColors.textPrimary,
+    letterSpacing: 1.5,
   );
 
-  static TextStyle get subheading => GoogleFonts.syne(
+  static TextStyle get displayMedium => GoogleFonts.blinker( //heading
+    fontSize: 30,
+    fontWeight: FontWeight.w700,
+    color: AppColors.textPrimary,
+    letterSpacing: 1.5
+  );
+
+  static TextStyle get heading => GoogleFonts.blinker( //pipleine headings
+    fontSize: 15,
+    fontWeight: FontWeight.w600,
+    color: AppColors.textPrimary,
+  );
+
+  static TextStyle get subheading => GoogleFonts.blinker(
     fontSize: 13,
     fontWeight: FontWeight.w600,
     color: AppColors.textPrimary,
   );
 
-  // ── KPI numbers (Syne bold) ───────────────────────────────────────────────
-  static TextStyle kpiValue(Color color) => GoogleFonts.syne(
+  // ── KPI numbers (Google Sans bold) ───────────────────────────────────────────────
+  static TextStyle kpiValue(Color color) => GoogleFonts.blinker(
     fontSize: 34,
-    fontWeight: FontWeight.w800,
+    fontWeight: FontWeight.w700,
     color: color,
-    height: 1.0,
+    letterSpacing: 1.5
   );
 
-  static TextStyle kpiValueSmall(Color color) => GoogleFonts.syne(
+  static TextStyle kpiValueSmall(Color color) => GoogleFonts.blinker(
     fontSize: 20,
     fontWeight: FontWeight.w700,
     color: color,
     height: 1.0,
   );
 
-  static TextStyle get kpiUnit => GoogleFonts.syne(
+  static TextStyle get kpiUnit => GoogleFonts.blinker(
     fontSize: 14,
-    fontWeight: FontWeight.w400,
+    fontWeight: FontWeight.w600,
     color: AppColors.textMuted,
   );
 
   // ── Body / Mono  (JetBrains Mono) ────────────────────────────────────────
-  static TextStyle get mono => GoogleFonts.jetBrainsMono(
-    fontSize: 11,
-    fontWeight: FontWeight.w400,
+  static TextStyle get mono => GoogleFonts.blinker( //pipeline health
+    fontSize: 12,
+    fontWeight: FontWeight.w600,
     color: AppColors.textSecondary,
+    letterSpacing: 1
   );
 
-  static TextStyle get monoSmall => GoogleFonts.jetBrainsMono(
-    fontSize: 9,
+  static TextStyle get monoSmall => GoogleFonts.blinker( //graphs axis
+    fontSize: 12,
+    fontWeight: FontWeight.w600,
+    color: AppColors.textPrimary.withOpacity(0.5),
+    letterSpacing: 1,
+  );
+
+  static TextStyle get monoLabel => GoogleFonts.blinker( //section headers
+    fontSize: 12,
     fontWeight: FontWeight.w400,
     color: AppColors.textPrimary.withOpacity(0.5),
-    letterSpacing: 0.1,
+    letterSpacing: 1,
   );
 
-  static TextStyle get monoLabel => GoogleFonts.jetBrainsMono(
-    fontSize: 9,
-    fontWeight: FontWeight.w400,
-    color: AppColors.textPrimary.withOpacity(0.5),
-    letterSpacing: 0.2,
-  );
-
-  static TextStyle monoColored(Color color) => GoogleFonts.jetBrainsMono(
+  static TextStyle monoColored(Color color) => GoogleFonts.blinker(
     fontSize: 11,
     fontWeight: FontWeight.w500,
     color: color,
   );
 
   // ── Nav labels ────────────────────────────────────────────────────────────
-  static TextStyle get navLabel => GoogleFonts.syne(
+  static TextStyle get navLabel => GoogleFonts.blinker(
     fontSize: 13,
     fontWeight: FontWeight.w400,
     color: AppColors.textSecondary,
   );
 
-  static TextStyle get navLabelActive => GoogleFonts.syne(
+  static TextStyle get navLabelActive => GoogleFonts.blinker(
     fontSize: 13,
     fontWeight: FontWeight.w600,
     color: AppColors.cyan,
   );
 
-  static TextStyle get navSectionLabel => GoogleFonts.jetBrainsMono(
+  static TextStyle get navSectionLabel => GoogleFonts.blinker(
     fontSize: 9,
     fontWeight: FontWeight.w400,
     color: AppColors.textPrimary.withOpacity(0.5),
@@ -100,22 +102,24 @@ class AppTextStyles {
   );
 
   // ── Table ────────────────────────────────────────────────────────────────
-  static TextStyle get tableHeader => GoogleFonts.jetBrainsMono(
-    fontSize: 9,
+  static TextStyle get tableHeader => GoogleFonts.blinker( //column headers
+    fontSize: 12,
     fontWeight: FontWeight.w400,
-    color: AppColors.textMuted,
+    color: AppColors.textSecondary,
     letterSpacing: 0.12,
   );
 
-  static TextStyle get tableCell => GoogleFonts.jetBrainsMono(
+  static TextStyle get tableCell => GoogleFonts.blinker( //cell values
     fontSize: 11,
     fontWeight: FontWeight.w400,
     color: AppColors.textSecondary,
+    letterSpacing: 1
   );
 
-  static TextStyle tableCellColored(Color color) => GoogleFonts.jetBrainsMono(
+  static TextStyle tableCellColored(Color color) => GoogleFonts.blinker( //colored cell values
     fontSize: 11,
     fontWeight: FontWeight.w500,
     color: color,
+    letterSpacing: 1
   );
 }

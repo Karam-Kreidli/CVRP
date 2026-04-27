@@ -163,7 +163,7 @@ class SolverController extends ChangeNotifier {
     PipelineStageData(
       stageNum: 1,
       name: 'Feature Extractor',
-      model: 'Hand-crafted (7-dim)',
+      model: 'Hand-crafted',
     ),
     PipelineStageData(
       stageNum: 2,

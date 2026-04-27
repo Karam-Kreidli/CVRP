@@ -1009,8 +1009,7 @@ class _BannerKpi extends StatelessWidget {
           Text( //kpi labels like "VEHICLES", "TOTAL DISTANCE" etc
             label,
             style: AppTextStyles.monoLabel.copyWith(
-              fontSize: 9,
-              letterSpacing: 0.15,
+              fontSize: 12,
             ),
           ),
           const SizedBox(height: 8),
@@ -1026,19 +1025,19 @@ class _BannerKpi extends StatelessWidget {
                       children: [
                         TextSpan(
                           text: value,
-                          style: GoogleFonts.syne(
+                          style: GoogleFonts.blinker(
                             fontSize: 28,
-                            fontWeight: FontWeight.w800,
+                            fontWeight: FontWeight.w700,
                             color: solution.customers.isEmpty
                                 ? AppColors.textMuted
                                 : color,
-                            height: 1.0,
+                            letterSpacing: 1.5
                           ),
                         ),
                         if (unit.isNotEmpty)
                           TextSpan(
                             text: ' $unit',
-                            style: GoogleFonts.syne(
+                            style: GoogleFonts.blinker(
                               fontSize: 13,
                               fontWeight: FontWeight.w600,
                               color: solution.customers.isEmpty
@@ -1055,11 +1054,11 @@ class _BannerKpi extends StatelessWidget {
           ] else ...[
             Text(
               value,
-              style: GoogleFonts.syne(
+              style: GoogleFonts.blinker(
                 fontSize: 9,
-                fontWeight: FontWeight.w800,
+                fontWeight: FontWeight.w700,
                 color: color,
-                height: 1.0,
+                letterSpacing: 1.5
               ),
               textAlign: TextAlign.center,
             ),
@@ -1067,7 +1066,7 @@ class _BannerKpi extends StatelessWidget {
             if (unit.isNotEmpty)
               Text(
                 unit,
-                style: GoogleFonts.syne(
+                style: GoogleFonts.blinker(
                   fontSize: 9,
                   fontWeight: FontWeight.w600,
                   color: color.withOpacity(0.7),
@@ -1143,9 +1142,9 @@ class _ExportButtonState extends State<_ExportButton> {
               const SizedBox(width: 8),
               Text(
                 widget.label,
-                style: GoogleFonts.jetBrainsMono(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w500,
+                style: GoogleFonts.blinker(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
                   color: displayColor,
                 ),
               ),

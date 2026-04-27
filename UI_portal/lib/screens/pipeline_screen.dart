@@ -327,9 +327,9 @@ class _FlowNodeState extends State<_FlowNode> {
         child: Text(
           widget.label,
           textAlign: TextAlign.center,
-          style: GoogleFonts.syne(
-            fontSize: 12,
-            fontWeight: FontWeight.w700,
+          style: GoogleFonts.blinker(
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
             color: widget.color,
             height: 1.3,
           ),
@@ -428,8 +428,8 @@ class _StageCardState extends State<_StageCard> {
                           child: Center(
                             child: Text(
                               '${s.num}',
-                              style: GoogleFonts.syne(
-                                fontSize: 16,
+                              style: GoogleFonts.blinker(
+                                fontSize: 20,
                                 fontWeight: FontWeight.w800,
                                 color: s.accentColor,
                               ),
@@ -473,10 +473,9 @@ class _StageCardState extends State<_StageCard> {
                               Text(
                                 s.description,
                                 style: AppTextStyles.mono.copyWith(
-                                  height: 1.75,
-                                  fontSize: 11,
+                                  fontSize: 12,
                                   fontFamily:
-                                      GoogleFonts.jetBrainsMono().fontFamily,
+                                      GoogleFonts.blinker().fontFamily,
                                 ),
                               ),
                             ],
@@ -584,7 +583,7 @@ class _StageCardState extends State<_StageCard> {
                                   '\u2022',
                                   style: AppTextStyles.monoSmall.copyWith(
                                     color: s.accentColor,
-                                    fontSize: 20,
+                                    fontSize: 22,
                                   ),
                                 ),
                                 const SizedBox(width: 8),
@@ -592,8 +591,7 @@ class _StageCardState extends State<_StageCard> {
                                   child: Text(
                                     b,
                                     style: AppTextStyles.monoSmall.copyWith(
-                                      fontSize: 10,
-                                      height: 1.6,
+                                      fontSize: 12,
                                     ),
                                   ),
                                 ),
